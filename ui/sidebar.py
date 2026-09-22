@@ -13,7 +13,7 @@ import streamlit as st
 
 from memory import MemoryStore
 from prompts.single_agent import QUICK_PROMPTS
-from ui.components import github_rate_limit_caption, mode_selector, repository_input
+from ui.components import github_rate_limit_caption, identity_input, mode_selector, repository_input, runtime_settings
 
 
 @dataclass
@@ -23,6 +23,9 @@ class SidebarState:
     owner: Optional[str]  # None when the text is empty or not a valid repository
     repo: Optional[str]
     repo_id: Optional[str]
+    lite_mode: bool
+    max_output_tokens: int
+    identity: Optional[str]  # optional name; keeps this person's chat separate on a shared instance
 
 
 def reset_screens(keep_new_chat_for: Optional[str] = None):
@@ -71,6 +74,8 @@ def render_sidebar(config, store: MemoryStore) -> SidebarState:
     with st.sidebar:
         st.header("⚙️ Mode")
         mode = mode_selector()
+        lite_mode, max_output_tokens = runtime_settings(config)
+        identity = identity_input()
         st.header("📦 Repository")
         owner, repo = repository_input()
         repo_id = MemoryStore.make_repo_id(owner, repo) if owner and repo else None
@@ -84,8 +89,11 @@ def render_sidebar(config, store: MemoryStore) -> SidebarState:
             _memory_controls(store, repo_id, mode)
 
         st.info(
-            f"**Model:** {config.openai_model}{' · 🪶 lite mode' if config.lite_mode else ''}  \n"
+            f"**Model:** {config.openai_model}{' · 🪶 lite mode' if lite_mode else ''}  \n"
             f"**GitHub token:** {'✅ configured' if config.github_token else '❌ not set (60 requests/hour)'}"
         )
         github_rate_limit_caption()
-    return SidebarState(mode=mode, repo_text=st.session_state.get("repo_text", "").strip(), owner=owner, repo=repo, repo_id=repo_id)
+    return SidebarState(
+        mode=mode, repo_text=st.session_state.get("repo_text", "").strip(), owner=owner, repo=repo, repo_id=repo_id,
+        lite_mode=lite_mode, max_output_tokens=max_output_tokens, identity=identity,
+    )

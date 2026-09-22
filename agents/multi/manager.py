@@ -17,7 +17,7 @@ from typing import Any, Optional, Sequence
 
 from agents.base import Agent
 from agents.loop import DEFAULT_MAX_OUTPUT_TOKENS, TRUNCATION_NOTE, explain_llm_error, resolve_llm
-from agents.multi.report import AgentStatus, HealthReport, assemble_report, confidence_label, evidence_text, unknown_citations
+from agents.multi.report import AgentStatus, HealthReport, assemble_report, confidence_label, evidence_text, sort_findings, unknown_citations
 from agents.usage import UsageMeter
 from memory import Finding, MemoryStore
 from prompts.multi_agent import get_manager_prompt
@@ -110,7 +110,9 @@ def build_manager_input(repo_id: str, findings: Sequence[Finding], statuses: Seq
     lines.append("\nTeam status:")
     for s in statuses:
         lines.append(f"- {s.title}: {s.state}, {s.findings} findings" + (f" | closing note: {s.message}" if s.message else ""))
-    shown = list(findings)[:MAX_FINDINGS_FOR_MANAGER]
+    # When a session has more findings than the Manager can see, keep the most severe ones rather than
+    # whichever specialist happened to save first — the last specialist to run should not be the one silently cut.
+    shown = sort_findings(findings)[:MAX_FINDINGS_FOR_MANAGER]
     lines.append(f"\nFindings ({len(shown)} of {len(findings)} shown), each as [#id] agent | severity/category | confidence: text | evidence:")
     for f in shown:
         evidence = evidence_text(f)[:MAX_EVIDENCE_CHARS]

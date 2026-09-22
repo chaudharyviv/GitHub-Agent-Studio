@@ -103,6 +103,11 @@ def _collect(
             items.append(item)
         if len(batch) < per_page:
             return items, False
+        if not keep and len(items) >= limit:
+            # limit == per_page (100 is GitHub's own page-size cap), so the "+1" trick above had no room on
+            # this page; check for one more item instead of paying for a whole extra page to find out.
+            extra = client.get(path, {**params, "per_page": 1, "page": limit + 1}, ttl=ttl) or []
+            return items, bool(extra)
     return items, True
 
 

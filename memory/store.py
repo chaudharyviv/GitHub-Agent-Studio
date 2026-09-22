@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     mode         TEXT NOT NULL,
     created_at   TEXT NOT NULL,
     completed_at TEXT,
-    metadata     TEXT
+    metadata     TEXT,
+    identity     TEXT  -- optional user-chosen name; NULL means shared/anonymous (see MemoryStore.list_sessions)
 );
 CREATE TABLE IF NOT EXISTS findings (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +124,9 @@ class MemoryStore:
             if self.db_path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.executescript(_SCHEMA)
+            columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+            if "identity" not in columns:  # DB created before per-identity session scoping existed
+                self._conn.execute("ALTER TABLE sessions ADD COLUMN identity TEXT")
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if version > SCHEMA_VERSION:
                 raise RuntimeError(
@@ -362,7 +366,7 @@ class MemoryStore:
 
     # -- sessions ------------------------------------------------------------
 
-    def create_session(self, repository_id: str, mode: str, metadata: Optional[str] = None) -> str:
+    def create_session(self, repository_id: str, mode: str, metadata: Optional[str] = None, identity: Optional[str] = None) -> str:
         """
         Create and persist a new investigation session.
 
@@ -370,6 +374,7 @@ class MemoryStore:
             repository_id: Repository being investigated (``owner/name``)
             mode: Investigation mode ("single_agent" or "multi_agent")
             metadata: Optional session-specific JSON
+            identity: Optional user-chosen name that started this session (see ``list_sessions``)
 
         Returns:
             Session ID (UUID hex)
@@ -380,8 +385,8 @@ class MemoryStore:
         with self._tx() as conn:
             repo_id = self._ensure_repo(conn, repository_id)
             conn.execute(
-                "INSERT INTO sessions (session_id, repo_id, mode, created_at, metadata) VALUES (?, ?, ?, ?, ?)",
-                (session_id, repo_id, mode, _to_text(datetime.now(timezone.utc)), metadata),
+                "INSERT INTO sessions (session_id, repo_id, mode, created_at, metadata, identity) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, repo_id, mode, _to_text(datetime.now(timezone.utc)), metadata, identity),
             )
         return session_id
 
@@ -408,13 +413,25 @@ class MemoryStore:
         return self._session_from_row(row) if row else None
 
     def list_sessions(
-        self, repo_id: str, mode: Optional[str] = None, limit: Optional[int] = None
+        self, repo_id: str, mode: Optional[str] = None, identity: Optional[str] = None, limit: Optional[int] = None
     ) -> List[InvestigationSession]:
-        """Sessions for a repository, newest first."""
+        """
+        Sessions for a repository, newest first.
+
+        Args:
+            identity: When given, only sessions started under this name, plus anonymous/legacy
+                sessions (``identity IS NULL``) started before anyone set a name, or by someone who
+                never set one. Findings and reports stay shared team knowledge; this only limits
+                which *conversation* a caller may silently resume, so on a shared instance, one
+                named person never drops into another named person's live chat.
+        """
         sql, args = "SELECT * FROM sessions WHERE repo_id = ?", [self._norm(repo_id)]
         if mode is not None:
             sql += " AND mode = ?"
             args.append(mode)
+        if identity is not None:
+            sql += " AND (identity = ? OR identity IS NULL)"
+            args.append(identity)
         sql += " ORDER BY created_at DESC, rowid DESC"
         if limit is not None:
             sql += " LIMIT ?"
@@ -428,29 +445,37 @@ class MemoryStore:
         return InvestigationSession(
             session_id=row["session_id"], repository_id=row["repo_id"], mode=row["mode"],
             created_at=_from_text(row["created_at"]), completed_at=_from_text(row["completed_at"]),
-            metadata=row["metadata"],
+            metadata=row["metadata"], identity=row["identity"],
         )
 
     # -- resume / clear / export ---------------------------------------------
 
     def get_resume_context(
-        self, repo_id: str, max_findings: int = 50, max_messages: int = 20
+        self, repo_id: str, max_findings: int = 50, max_messages: int = 20, identity: Optional[str] = None
     ) -> ResumeContext:
         """
         Everything needed to "continue where we stopped" on a repository:
         profile, the latest session, recent findings and messages, and user context.
+
+        Findings and profile are shared team knowledge, so they are never scoped. ``recent_messages``
+        feeds straight into the model's context, so when ``identity`` is given it is restricted to
+        this name's own conversation turns (plus anonymous/legacy messages) instead of whatever
+        anyone last said to the agent.
         """
         repo_id = self._norm(repo_id)
-        sessions = self.list_sessions(repo_id, limit=1)
+        sessions = self.list_sessions(repo_id, identity=identity, limit=1)
+        where = "JOIN sessions s ON s.session_id = m.session_id WHERE s.repo_id = ?"
+        args: list = [repo_id]
+        if identity is not None:
+            where += " AND (s.identity = ? OR s.identity IS NULL)"
+            args.append(identity)
         return ResumeContext(
             repo_id=repo_id,
             profile=self._profile(repo_id),
             last_session=sessions[0] if sessions else None,
             findings=self.get_findings(repo_id, limit=max_findings),
             user_context=self.get_user_context(repo_id),
-            recent_messages=self._messages(
-                "JOIN sessions s ON s.session_id = m.session_id WHERE s.repo_id = ?", [repo_id], max_messages
-            ),
+            recent_messages=self._messages(where, args, max_messages),
         )
 
     def clear_repository_memory(self, repo_id: str) -> None:

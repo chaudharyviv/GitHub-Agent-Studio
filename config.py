@@ -10,6 +10,7 @@ directory, so the app behaves the same wherever it is launched from.
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ENV_FILE = Path(__file__).resolve().parent / ".env"
@@ -33,7 +34,7 @@ class Config(BaseSettings):
 
     openai_api_key: str
     openai_model: str = "gpt-4o-mini"
-    max_output_tokens: int = 2048
+    max_output_tokens: int = Field(2048, ge=16, le=16_000)
     lite_mode: bool = False
     github_token: str | None = None
 

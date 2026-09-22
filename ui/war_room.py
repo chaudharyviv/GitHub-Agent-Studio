@@ -5,6 +5,8 @@ Four tabs: run the team (live), read the report, compare with the single agent, 
 All logic lives in ``orchestration.runner``; this module only draws what it streams.
 """
 
+from typing import Optional
+
 import streamlit as st
 
 from agents.multi import SPECIALISTS
@@ -32,11 +34,13 @@ def _load_state(store: MemoryStore, repo_id: str) -> dict:
     return state
 
 
-def _run_team(store: MemoryStore, state: dict, owner: str, repo: str, chosen: list[str], focus: str, dashboard, live):
+def _run_team(store: MemoryStore, state: dict, owner: str, repo: str, chosen: list[str], focus: str, dashboard, live,
+              max_output_tokens: int, lite_mode: bool):
     """Stream one War Room run into the page."""
     state.update(report=None, narrative=None, usage="")
     current = None
-    for ev in stream_war_room(owner, repo, focus or None, store=store, only=chosen):
+    for ev in stream_war_room(owner, repo, focus or None, store=store, only=chosen,
+                               max_output_tokens=max_output_tokens, lite_mode=lite_mode):
         if ev.statuses:
             state["statuses"] = ev.statuses
             with dashboard.container():
@@ -64,7 +68,10 @@ def _run_team(store: MemoryStore, state: dict, owner: str, repo: str, chosen: li
             st.success("War Room finished. Open the **Report** tab.")
 
 
-def render_war_room(store: MemoryStore, config, owner: str, repo: str, repo_id: str):
+def render_war_room(store: MemoryStore, owner: str, repo: str, repo_id: str, max_output_tokens: int, lite_mode: bool,
+                     identity: Optional[str] = None):
+    # War Room reports are a shared team artifact by design (unlike the single-agent chat), so unlike
+    # ``render_single_agent`` this intentionally does not scope resumption by ``identity``.
     state = _load_state(store, repo_id)
     st.caption(f"War Room for **{repo_id}**" + (" · showing the last saved report" if state["report"] else ""))
     run_tab, report_tab, compare_tab, memory_tab = st.tabs(["🛰️ War Room", "📋 Report", "🆚 Single vs Team", "🧠 Memory"])
@@ -81,7 +88,7 @@ def render_war_room(store: MemoryStore, config, owner: str, repo: str, repo_id: 
         dashboard = st.empty()
         live = st.container()
         if run:
-            _run_team(store, state, owner, repo, chosen, focus.strip(), dashboard, live)
+            _run_team(store, state, owner, repo, chosen, focus.strip(), dashboard, live, max_output_tokens, lite_mode)
         else:
             with dashboard.container():
                 agent_status_dashboard(state["statuses"])

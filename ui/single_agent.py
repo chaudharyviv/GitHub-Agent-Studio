@@ -9,17 +9,20 @@ import json
 
 import streamlit as st
 
+from typing import Optional
+
+from agents.limits import LITE, NORMAL
 from agents.single import SingleAgent
 from memory import MemoryStore
 from ui.components import memory_panel, render_events, tool_timeline
 
 
-def load_chat(store: MemoryStore, repo_id: str) -> dict:
-    """Chat state for a repository; resumes the most recent single-agent session from memory if there is one."""
+def load_chat(store: MemoryStore, repo_id: str, identity: Optional[str]) -> dict:
+    """Chat state for a repository; resumes this name's most recent single-agent session, if any."""
     chat = st.session_state.get("chat")
     if chat and chat["repo_id"] == repo_id:
         return chat
-    sessions = store.list_sessions(repo_id, mode="single_agent", limit=1)
+    sessions = store.list_sessions(repo_id, mode="single_agent", identity=identity, limit=1)
     session_id = sessions[0].session_id if sessions else None
     messages = []
     for m in store.get_conversation_history(session_id) if session_id else []:
@@ -41,9 +44,9 @@ def render_chat_history(chat: dict):
             st.markdown(message["content"])
 
 
-def run_turn(store: MemoryStore, config, chat: dict, owner: str, repo: str, prompt: str):
+def run_turn(store: MemoryStore, chat: dict, owner: str, repo: str, prompt: str, max_output_tokens: int, lite_mode: bool, identity: Optional[str]):
     """Run one user turn, streaming every agent step into the page as it happens."""
-    agent = SingleAgent(store, max_output_tokens=config.max_output_tokens)
+    agent = SingleAgent(store, max_output_tokens=max_output_tokens, limits=LITE if lite_mode else NORMAL, identity=identity)
     if chat["session_id"] is None:
         chat["session_id"] = agent.start_session(owner, repo)
     chat["messages"].append({"role": "user", "content": prompt, "events": []})
@@ -68,8 +71,9 @@ def run_turn(store: MemoryStore, config, chat: dict, owner: str, repo: str, prom
     chat["messages"].append({"role": "assistant", "content": answer, "events": [e for e in events if e.kind != "final"]})
 
 
-def render_single_agent(store: MemoryStore, config, owner: str, repo: str, repo_id: str):
-    chat = load_chat(store, repo_id)
+def render_single_agent(store: MemoryStore, owner: str, repo: str, repo_id: str, max_output_tokens: int, lite_mode: bool,
+                         identity: Optional[str] = None):
+    chat = load_chat(store, repo_id, identity)
     st.caption(f"Investigating **{repo_id}**" + (" · resumed previous session" if chat["messages"] else ""))
     chat_tab, memory_tab = st.tabs(["💬 Investigation", "🧠 Memory"])
 
@@ -77,6 +81,6 @@ def render_single_agent(store: MemoryStore, config, owner: str, repo: str, repo_
     with chat_tab:
         render_chat_history(chat)
         if prompt:
-            run_turn(store, config, chat, owner, repo, prompt)
+            run_turn(store, chat, owner, repo, prompt, max_output_tokens, lite_mode, identity)
     with memory_tab:  # rendered after the turn so it reflects anything just saved
         memory_panel(store, repo_id)

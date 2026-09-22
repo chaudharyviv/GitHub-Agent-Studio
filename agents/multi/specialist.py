@@ -12,7 +12,7 @@ Subclasses only declare who they are, which tools they may use, and their prompt
 from typing import Any, Callable, ClassVar, Iterator, List, Optional
 
 from agents.base import Agent, AgentEvent, InvestigationResult
-from agents.limits import get_limits
+from agents.limits import Limits, get_limits
 from agents.loop import resolve_llm, run_tool_loop
 from agents.toolbox import Toolbox
 from agents.usage import UsageMeter
@@ -55,10 +55,12 @@ class SpecialistAgent(Agent):
         model: Optional[str] = None,
         max_steps: Optional[int] = None,
         max_output_tokens: int = DEFAULT_SPECIALIST_MAX_OUTPUT_TOKENS,
+        limits: Optional[Limits] = None,
     ):
         super().__init__(self.agent_id)
         self.store, self.max_output_tokens = store, max_output_tokens
-        self.max_steps = max_steps or get_limits().specialist_steps  # 8, or 5 in LITE_MODE
+        self.limits = limits or get_limits()
+        self.max_steps = max_steps or self.limits.specialist_steps  # 8, or 5 in LITE_MODE
         self.usage = UsageMeter()  # tokens and estimated cost across everything this agent has run
         self._client, self._model = client, model
 
@@ -88,7 +90,7 @@ class SpecialistAgent(Agent):
             return
 
         repo_id = MemoryStore.make_repo_id(owner, repo)
-        toolbox = Toolbox(owner, repo, self.store, session_id, agent_name=self.agent_id, include=(*self.tools, *_MEMORY_TOOLS), categories=self.categories)
+        toolbox = Toolbox(owner, repo, self.store, session_id, agent_name=self.agent_id, include=(*self.tools, *_MEMORY_TOOLS), categories=self.categories, limits=self.limits)
         teammates = [f for f in self.store.get_findings(repo_id, session_id=session_id) if f.agent != self.agent_id]
         task = f"Audit {owner}/{repo} from your specialist perspective and record your structured findings."
         if query:
@@ -119,7 +121,7 @@ class SpecialistAgent(Agent):
             yield AgentEvent(kind="reasoning", step=final.step, content="Finished without saving any findings; asking for them.")
             messages.append({"role": "user", "content": _NUDGE})
             # The nudge can only save: no more exploring, so it is short and cheap.
-            active_box = Toolbox(owner, repo, self.store, session_id, agent_name=self.agent_id, include=_MEMORY_TOOLS, categories=self.categories)
+            active_box = Toolbox(owner, repo, self.store, session_id, agent_name=self.agent_id, include=_MEMORY_TOOLS, categories=self.categories, limits=self.limits)
             active_steps = NUDGE_STEPS
 
     def _my_findings(self, repo_id: str, session_id: str) -> List[Finding]:

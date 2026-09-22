@@ -73,7 +73,8 @@ def run_app():
         return
 
     screen = render_war_room if side.mode == "multi_agent" else render_single_agent
-    screen(store, config, side.owner, side.repo, side.repo_id)
+    screen(store, side.owner, side.repo, side.repo_id, max_output_tokens=side.max_output_tokens, lite_mode=side.lite_mode,
+           identity=side.identity)
 
 
 def main():

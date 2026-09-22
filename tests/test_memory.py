@@ -129,6 +129,31 @@ def test_sessions(store):
         store.complete_session("nope")
 
 
+def test_sessions_scoped_by_identity(store):
+    anon = store.create_session(REPO, "single_agent")  # created before anyone set a name
+    alice = store.create_session(REPO, "single_agent", identity="alice")
+    bob = store.create_session(REPO, "single_agent", identity="bob")
+
+    # no name given: everything is visible, same as before identity scoping existed
+    assert {s.session_id for s in store.list_sessions(REPO)} == {anon, alice, bob}
+    # a named person sees their own sessions plus anonymous/legacy ones, but not another name's
+    assert {s.session_id for s in store.list_sessions(REPO, identity="alice")} == {anon, alice}
+    assert {s.session_id for s in store.list_sessions(REPO, identity="bob")} == {anon, bob}
+
+
+def test_resume_context_scoped_by_identity(store):
+    alice = store.create_session(REPO, "single_agent", identity="alice")
+    store.save_conversation_message(ConversationMessage(session_id=alice, role="user", content="alice's message"))
+    bob = store.create_session(REPO, "single_agent", identity="bob")
+    store.save_conversation_message(ConversationMessage(session_id=bob, role="user", content="bob's message"))
+
+    ctx = store.get_resume_context(REPO, identity="alice")
+    assert ctx.last_session.session_id == alice
+    assert [m.content for m in ctx.recent_messages] == ["alice's message"]
+    # findings/profile stay shared team knowledge regardless of identity (none saved here, but the call must not scope them away)
+    assert ctx.findings == []
+
+
 def test_resume_context(store):
     empty = store.get_resume_context(REPO)
     assert empty.last_session is None and empty.findings == [] and empty.profile is None
@@ -188,6 +213,31 @@ def test_persists_across_restart(tmp_path):
     assert second.get_user_context(REPO)[0].value == "v"
     assert second.get_resume_context(REPO).last_session.session_id == sid
     second.close()
+
+
+def test_migrates_pre_identity_database(tmp_path):
+    """A DB written before per-identity session scoping existed gets the new column added, not recreated."""
+    import sqlite3
+
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE repositories (repo_id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL,
+                                    last_analyzed TEXT, profile_json TEXT);
+        CREATE TABLE sessions (session_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, mode TEXT NOT NULL,
+                                created_at TEXT NOT NULL, completed_at TEXT, metadata TEXT);
+        INSERT INTO repositories (repo_id, owner, name) VALUES ('octo/demo', 'octo', 'demo');
+        INSERT INTO sessions (session_id, repo_id, mode, created_at) VALUES ('legacy-1', 'octo/demo', 'single_agent', '2024-01-01T00:00:00+00:00');
+    """)
+    conn.commit()
+    conn.close()
+
+    store = MemoryStore(path)
+    sessions = store.list_sessions(REPO)
+    assert [s.session_id for s in sessions] == ["legacy-1"]
+    assert sessions[0].identity is None
+    assert [s.session_id for s in store.list_sessions(REPO, identity="alice")] == ["legacy-1"]  # legacy rows stay visible
+    store.close()
 
 
 def test_rejects_database_from_newer_version(tmp_path):

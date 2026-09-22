@@ -17,6 +17,7 @@ from typing import Any, Iterator, Literal, Optional, Sequence
 from pydantic import BaseModel, Field
 
 from agents.base import AgentEvent, InvestigationResult
+from agents.limits import LITE, NORMAL
 from agents.loop import resolve_llm
 from agents.multi import SPECIALISTS
 from agents.multi.manager import ManagerAgent
@@ -85,6 +86,8 @@ def stream_war_room(
     client: Any = None,
     model: Optional[str] = None,
     only: Optional[Sequence[str]] = None,
+    max_output_tokens: Optional[int] = None,
+    lite_mode: Optional[bool] = None,
 ) -> Iterator[WarRoomEvent]:
     """
     Run the specialists in order, then the Manager, yielding an event for every step.
@@ -108,12 +111,16 @@ def stream_war_room(
     snapshot = lambda: [s.model_copy() for s in statuses]  # noqa: E731  (events must not change after they are yielded)
     yield WarRoomEvent(kind="start", session_id=session_id, statuses=snapshot())
 
+    manager_kwargs = {"max_output_tokens": max_output_tokens} if max_output_tokens is not None else {}
+    specialist_kwargs = dict(manager_kwargs)
+    if lite_mode is not None:  # explicit override; omitted, each specialist falls back to LITE_MODE from the environment
+        specialist_kwargs["limits"] = LITE if lite_mode else NORMAL
     usage = UsageMeter()
     for cls, status in zip(classes, statuses):
         status.state = "running"
         yield WarRoomEvent(kind="agent_start", session_id=session_id, agent_id=cls.agent_id, title=cls.title, statuses=snapshot())
 
-        agent = cls(store, client=client, model=model)
+        agent = cls(store, client=client, model=model, **specialist_kwargs)
         last: Optional[AgentEvent] = None
         for event in agent.run(owner, repo, session_id, user_query):
             last = event
@@ -128,7 +135,7 @@ def stream_war_room(
                            statuses=snapshot(), usage=agent.usage.summary())
 
     yield WarRoomEvent(kind="manager_start", session_id=session_id, title="Manager", statuses=snapshot())
-    manager = ManagerAgent(store, client=client, model=model)
+    manager = ManagerAgent(store, client=client, model=model, **manager_kwargs)
     report = manager.synthesize(owner, repo, session_id, statuses, user_query)
     for field in ("calls", "prompt_tokens", "cached_tokens", "completion_tokens"):
         setattr(usage, field, getattr(usage, field) + getattr(manager.usage, field))

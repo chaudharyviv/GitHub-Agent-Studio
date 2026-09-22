@@ -111,6 +111,7 @@ class InvestigationSession(BaseModel):
     created_at: datetime = Field(default_factory=utcnow)
     completed_at: Optional[datetime] = None
     metadata: Optional[str] = None  # Session-specific metadata as JSON
+    identity: Optional[str] = None  # optional user-chosen name that started this session; None for shared/anonymous
 
 
 class ResumeContext(BaseModel):

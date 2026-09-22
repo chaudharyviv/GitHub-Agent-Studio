@@ -42,6 +42,24 @@ logger = logging.getLogger(__name__)
 # Inputs
 # ---------------------------------------------------------------------------
 
+def identity_input(key: str = "identity_name") -> Optional[str]:
+    """
+    Optional name, so more than one person can share one deployed instance without one
+    person's chat silently resuming someone else's.
+
+    Blank (the default) behaves exactly as before: one continuous, shared history per
+    repository — the right default for a single local user. Findings and War Room reports
+    are always shared team knowledge either way; this only scopes which *conversation*
+    auto-resumes for a repository, and which past messages feed the model's context.
+    """
+    name = st.text_input(
+        "👤 Your name", key=key, placeholder="optional — leave blank to share history with everyone",
+        help="Set this if this instance is shared with others, so your chat stays separate from theirs. "
+             "Findings and reports stay visible to everyone regardless.",
+    ).strip()
+    return name or None
+
+
 def repository_input(key: str = "repo_text"):
     """
     Display a repository input widget.
@@ -74,6 +92,31 @@ def mode_selector(key: str = "mode") -> str:
         "Investigation mode", MODES, format_func=_MODE_LABELS.__getitem__, key=key,
         help="Single Agent: a transparent agent you can chat with. War Room: four specialists + a manager write a report.",
     )
+
+
+def runtime_settings(config) -> tuple[bool, int]:
+    """
+    Display the Lite/Full mode toggle and the max output tokens control.
+
+    Lite mode shrinks tool results and tool-calling rounds (see ``agents.limits``) for
+    cheap test runs; Full mode is the thorough default. Both default to what's in
+    ``config`` (env-configured) but can be overridden per session from the sidebar.
+
+    Returns:
+        Tuple of (lite_mode, max_output_tokens).
+    """
+    lite_mode = st.toggle(
+        "🪶 Lite mode", value=config.lite_mode, key="lite_mode_override",
+        help="On: smaller tool results and fewer tool-calling rounds, for cheap test runs. "
+             "Off (Full mode): the thorough default.",
+    )
+    min_tokens, max_tokens = 256, 16_000
+    max_output_tokens = st.number_input(
+        "Max output tokens", min_value=min_tokens, max_value=max_tokens, step=256,
+        value=min(max(config.max_output_tokens, min_tokens), max_tokens), key="max_output_tokens_override",
+        help="Cap on tokens the model may generate per call. Higher allows longer answers and reports, at higher cost.",
+    )
+    return lite_mode, int(max_output_tokens)
 
 
 # ---------------------------------------------------------------------------

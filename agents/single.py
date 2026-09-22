@@ -15,7 +15,7 @@ Findings and user context are saved by the model itself, through memory tools.
 from typing import Any, Iterator, Optional
 
 from agents.base import Agent, AgentEvent, InvestigationResult
-from agents.limits import get_limits
+from agents.limits import Limits, get_limits
 from agents.loop import DEFAULT_MAX_OUTPUT_TOKENS, resolve_llm, run_tool_loop, tool_log_entry
 from agents.toolbox import Toolbox
 from agents.usage import UsageMeter
@@ -34,7 +34,7 @@ class SingleAgent(Agent):
     """
 
     def __init__(self, store: MemoryStore, client: Any = None, model: Optional[str] = None, max_steps: Optional[int] = None,
-                 max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS):
+                 max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS, limits: Optional[Limits] = None, identity: Optional[str] = None):
         """
         Args:
             store: Long-term memory (findings, user context, chat history)
@@ -42,15 +42,20 @@ class SingleAgent(Agent):
             model: Model name; defaults to OPENAI_MODEL (gpt-4o-mini)
             max_steps: Most tool-calling rounds before the agent must answer (default 10, or 6 in LITE_MODE)
             max_output_tokens: Cap on tokens the model may generate per call
+            limits: Size limits (tool result caps, etc); defaults to ``LITE_MODE``-derived limits when omitted
+            identity: Optional user-chosen name, so this session and its conversation don't get pulled
+                into another named person's chat on a shared instance (see ``MemoryStore.list_sessions``).
+                None (the default) means shared/anonymous, same as before this existed.
         """
         super().__init__("single_agent")
-        self.store, self.max_output_tokens = store, max_output_tokens
-        self.max_steps = max_steps or get_limits().single_agent_steps
+        self.store, self.max_output_tokens, self.identity = store, max_output_tokens, identity
+        self.limits = limits or get_limits()
+        self.max_steps = max_steps or self.limits.single_agent_steps
         self.usage = UsageMeter()  # tokens and estimated cost across everything this agent has run
         self._client, self._model = client, model
 
     def start_session(self, owner: str, repo: str) -> str:
-        return self.store.create_session(MemoryStore.make_repo_id(owner, repo), "single_agent")
+        return self.store.create_session(MemoryStore.make_repo_id(owner, repo), "single_agent", identity=self.identity)
 
     def investigate(self, owner: str, repo: str, query: Optional[str] = None, session_id: Optional[str] = None) -> InvestigationResult:
         """Run to completion and return everything (use ``run`` to watch it live)."""
@@ -74,8 +79,9 @@ class SingleAgent(Agent):
             return
 
         repo_id = MemoryStore.make_repo_id(owner, repo)
-        toolbox = Toolbox(owner, repo, self.store, session_id, agent_name=self.agent_id)
-        system = get_single_agent_system_prompt(self.max_steps) + "\n\n" + build_memory_context(self.store.get_resume_context(repo_id))
+        toolbox = Toolbox(owner, repo, self.store, session_id, agent_name=self.agent_id, limits=self.limits)
+        system = get_single_agent_system_prompt(self.max_steps) + "\n\n" + build_memory_context(
+            self.store.get_resume_context(repo_id, identity=self.identity))
         history = self.store.get_conversation_history(session_id, limit=HISTORY_LIMIT)
         messages: list[dict] = [{"role": "system", "content": system}]
         messages += [{"role": m.role, "content": m.content} for m in history]

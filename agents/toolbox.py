@@ -219,7 +219,7 @@ class Toolbox:
     def _save_finding(self, args: SaveFindingArgs) -> MemoryWriteResult:
         if self.categories is not None and args.category not in self.categories:
             raise ValueError(f"category {args.category!r} is not allowed for you. Call save_finding again with the same finding and one of these categories: {', '.join(self.categories)}")
-        for existing in self.store.get_findings(self.repo_id, category=args.category):
+        for existing in self.store.get_findings(self.repo_id, session_id=self.session_id, category=args.category):
             if existing.finding.strip().lower() == args.finding.strip().lower():
                 return MemoryWriteResult(saved=False, message=f"Already recorded as finding #{existing.id}; not saved again.")
         finding_id = self.store.save_finding(Finding(
