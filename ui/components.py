@@ -110,7 +110,7 @@ def runtime_settings(config) -> tuple[bool, int]:
         help="On: smaller tool results and fewer tool-calling rounds, for cheap test runs. "
              "Off (Full mode): the thorough default.",
     )
-    min_tokens, max_tokens = 256, 16_000
+    min_tokens, max_tokens = 256, 16_384  # 16384 is gpt-4o-mini's own per-call output cap
     max_output_tokens = st.number_input(
         "Max output tokens", min_value=min_tokens, max_value=max_tokens, step=256,
         value=min(max(config.max_output_tokens, min_tokens), max_tokens), key="max_output_tokens_override",

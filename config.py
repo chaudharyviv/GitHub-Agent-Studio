@@ -34,7 +34,7 @@ class Config(BaseSettings):
 
     openai_api_key: str
     openai_model: str = "gpt-4o-mini"
-    max_output_tokens: int = Field(2048, ge=16, le=16_000)
+    max_output_tokens: int = Field(2048, ge=16, le=16_384)  # 16384 is gpt-4o-mini's own per-call output cap
     lite_mode: bool = False
     github_token: str | None = None
 

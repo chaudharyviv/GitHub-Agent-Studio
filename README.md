@@ -2,7 +2,7 @@
 
 An educational AI agent project that investigates any public GitHub repository using OpenAI's `gpt-4o-mini` model.
 
-**Status:** Phase 0 (Project Skeleton) — See `spec.md` and `plan.md` for full roadmap.
+**Status:** Feature-complete for v1 — both investigation modes work end-to-end, with a persistent SQLite memory layer and 169 passing tests. See `spec.md` and `plan.md` for the original design and roadmap this was built from.
 
 ## Overview
 
@@ -66,26 +66,16 @@ A team of specialized agents coordinated by a manager:
 
 7. Open your browser to `http://localhost:8501`
 
-## Current Status
+## Using the app
 
-**Phase 0 — Project Skeleton** ✅ Complete
-- ✅ Directory structure and module organization
-- ✅ Configuration management (pydantic-settings)
-- ✅ Type schemas (Pydantic models)
-- ✅ Agent base classes and stubs
-- ✅ Minimal Streamlit UI shell
-- ✅ Database schema design
+The sidebar controls apply to both modes:
 
-**Upcoming Phases**
-- Phase 1: GitHub Tools Layer (fetch data from GitHub API)
-- Phase 2: Memory Layer (SQLite persistence)
-- Phase 3: Single Agent Mode (full investigation loop)
-- Phase 4: Multi-Agent Specialists (four specialized agents)
-- Phase 5: Manager + Orchestration (synthesis and reports)
-- Phase 6: UI Polish & Integration (complete user experience)
-- Phase 7: Documentation & Demo Polish
+- **Investigation mode** — Single Agent or Multi-Agent War Room.
+- **🪶 Lite mode** — shrinks tool results and tool-calling rounds for cheap test runs (see `agents/limits.py`); off by default for thorough investigations.
+- **Max output tokens** — cap on how much the model may write per call (256–16,384); higher allows longer answers and reports at higher cost.
+- **👤 Your name** — optional. Leave blank to share one continuous history per repository (the default, right for a single local user). If more than one person uses the same running instance, each person can set a name so their chat doesn't get mixed up with someone else's. Findings and War Room reports are always shared team knowledge regardless of this setting — only the live *conversation* is scoped by name.
 
-See `plan.md` for detailed timeline and `spec.md` for complete requirements.
+Type a repository as `owner/repo` or a full GitHub URL, then either chat with the single agent or run the War Room team.
 
 ## Architecture
 
@@ -94,31 +84,43 @@ github-agent-studio/
 ├── app.py                    # Thin Streamlit UI wiring
 ├── config.py                 # Environment configuration
 ├── agents/                   # Agent implementations
-│   ├── base.py              # Base agent class
-│   ├── single.py            # Single agent loop
-│   └── multi/               # Specialist agents
+│   ├── base.py               # Base agent class
+│   ├── single.py              # Single agent loop
+│   ├── toolbox.py             # Tool dispatch + memory side effects
+│   ├── loop.py                 # Shared OpenAI tool-calling loop
+│   ├── limits.py                # Lite/Full mode size limits
+│   ├── usage.py                  # Token/cost accounting
+│   └── multi/                   # Specialist agents
 │       ├── manager.py
+│       ├── specialist.py         # Shared specialist base class
 │       ├── architecture.py
 │       ├── security.py
 │       ├── quality.py
-│       └── health.py
+│       ├── health.py
+│       └── report.py             # Health report assembly
 ├── tools/                    # GitHub API tools
-│   ├── github.py            # Tool implementations
-│   └── schemas.py           # Pydantic input/output models
+│   ├── github.py             # Tool implementations
+│   ├── client.py              # HTTP client + rate limiting
+│   ├── cache.py                # Response caching
+│   └── schemas.py             # Pydantic input/output models
 ├── memory/                   # SQLite persistence
-│   ├── store.py             # Database layer
-│   └── schemas.py           # Memory data models
-├── orchestration/           # Agent coordination
-│   └── runner.py            # Single and multi-agent runners
-├── ui/                      # Streamlit components
-│   ├── components.py        # Reusable UI widgets
-│   └── styles.py            # Theming and styling
-├── prompts/                 # LLM system prompts
+│   ├── store.py               # Database layer
+│   └── schemas.py              # Memory data models
+├── orchestration/            # Agent coordination
+│   └── runner.py              # Single and multi-agent runners
+├── ui/                       # Streamlit components
+│   ├── sidebar.py             # Mode, repository, memory controls
+│   ├── single_agent.py         # Single Agent screen
+│   ├── war_room.py              # War Room screen
+│   ├── components.py            # Reusable UI widgets
+│   └── styles.py                # Theming and styling
+├── prompts/                  # LLM system prompts
 │   ├── single_agent.py
 │   └── multi_agent.py
-├── spec.md                  # Full feature specification
-├── plan.md                  # Implementation roadmap
-└── requirements.txt         # Python dependencies
+├── tests/                    # pytest suite (169 tests)
+├── spec.md                   # Full feature specification
+├── plan.md                   # Implementation roadmap
+└── requirements.txt          # Python dependencies
 ```
 
 ## Key Technical Decisions
@@ -134,16 +136,20 @@ github-agent-studio/
 
 ## Configuration
 
-All configuration comes from environment variables or `.env`:
+All configuration comes from environment variables or `.env` (see `.env.example`):
 
 ```bash
 # Required
 OPENAI_API_KEY=sk-...
 
 # Optional
-OPENAI_MODEL=gpt-4o-mini    # Default: gpt-4o-mini (locked for v1)
-GITHUB_TOKEN=ghp_...         # Recommended for higher rate limits
+OPENAI_MODEL=gpt-4o-mini     # Default: gpt-4o-mini (locked for v1)
+MAX_OUTPUT_TOKENS=2048        # Default per-call output cap; also adjustable live in the sidebar (256-16384)
+LITE_MODE=0                    # Default cheap-test-run toggle; also adjustable live in the sidebar
+GITHUB_TOKEN=ghp_...             # Recommended for higher rate limits
 ```
+
+`MAX_OUTPUT_TOKENS` and `LITE_MODE` are just the defaults the sidebar starts from — anyone running the app can override either one per session without touching `.env`.
 
 ## Learning Path
 
@@ -151,16 +157,16 @@ New to AI agents? Start here:
 
 1. **Understand the structure** → Read `spec.md` and `plan.md`
 2. **Explore the code** → Browse the module organization in `agents/`, `tools/`, `memory/`
-3. **Study the skeleton** → See how agent types are defined in `agents/base.py` and `agents/single.py`
-4. **Follow Phase 3** → Once Phase 3 is implemented, study the single-agent loop code
-5. **Compare modes** → Once Phase 5 is complete, compare single vs. multi-agent approaches
+3. **Study the single-agent loop** → `agents/single.py` and the shared tool-calling loop in `agents/loop.py`
+4. **Study the multi-agent team** → `agents/multi/specialist.py` (shared base class), then the Manager in `agents/multi/manager.py` and orchestration in `orchestration/runner.py`
+5. **Compare modes** → Run the same repository through both modes and compare via the War Room's "Single vs Team" tab
 
 ## Non-Goals (v1)
 
 - Private repository support
 - Real vulnerability scanning (static heuristics only)
 - Full static analysis engines
-- Multi-user authentication
+- Full multi-user authentication (there's a lightweight opt-in name field to keep concurrent people's chats separate on a shared instance — see "Using the app" above — but no accounts, passwords, or verified identity)
 - Production cloud deployment
 - Support for non-OpenAI LLM providers
 - LangGraph, CrewAI, or similar frameworks in core path
@@ -173,7 +179,7 @@ This is an educational portfolio project. Contributions are welcome!
 - Keep `app.py` thin — all logic lives in modules
 - Use Pydantic models for all data transfer
 - Document all agent responsibilities clearly
-- Test locally before submitting changes
+- Test locally before submitting changes (`pytest`)
 
 ## License
 
@@ -188,4 +194,4 @@ MIT (see LICENSE file)
 
 ---
 
-**Note:** This project is an educational demonstration of AI agent patterns. It is not intended for production use without significant additional work on error handling, rate limiting, and security.
+**Note:** This project is an educational demonstration of AI agent patterns. It is not intended for production use without significant additional work on error handling, rate limiting, and security — in particular, real authentication if it's ever deployed for more than one person.
