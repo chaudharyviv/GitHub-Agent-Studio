@@ -13,7 +13,7 @@ Findings written to memory (categories):
 """
 
 from agents.multi.specialist import SpecialistAgent
-from prompts.multi_agent import get_architecture_prompt
+from prompts.multi_agent import ARCHITECTURE_CATEGORIES, get_architecture_prompt
 
 
 class ArchitectureSpecialist(SpecialistAgent):
@@ -26,4 +26,5 @@ class ArchitectureSpecialist(SpecialistAgent):
     agent_id = "architecture_specialist"
     title = "Architecture"
     tools = ("get_repository", "get_repository_tree", "get_file_content", "get_dependency_files")
+    categories = ARCHITECTURE_CATEGORIES
     prompt = staticmethod(get_architecture_prompt)

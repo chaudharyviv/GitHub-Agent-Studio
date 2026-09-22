@@ -35,7 +35,6 @@ from tools.schemas import (
     PullRequestInput,
     PullRequestsOutput,
     Release,
-    ReleaseAsset,
     ReleaseInput,
     ReleasesOutput,
     RepositoryInput,
@@ -54,7 +53,7 @@ CONTENT_TTL = 900.0
 ACTIVITY_TTL = 120.0  # issues / PRs / commits change often
 
 MAX_COMMIT_MESSAGE_CHARS = 300
-MAX_RELEASE_BODY_CHARS = 2_000
+MAX_RELEASE_BODY_CHARS = 300  # cadence and versioning are what matter; full notes are large and rarely needed
 
 
 def _tool(fn: F) -> F:
@@ -107,6 +106,13 @@ def _collect(
     return items, True
 
 
+def _list_note(what: str, returned: int, has_more: bool) -> str:
+    """Plain-language statement of whether a list is the whole thing, so a count of it is never mistaken for a total."""
+    if has_more:
+        return (f"Only {returned} {what} are shown. There are MORE than {returned}, so do not report {returned} as the total.")
+    return f"All {returned} matching {what} are shown: this is the complete list, so {returned} is the exact total."
+
+
 # ---------------------------------------------------------------------------
 # get_repository
 # ---------------------------------------------------------------------------
@@ -127,7 +133,7 @@ def get_repository(input_data: RepositoryInput) -> RepositoryOutput | ToolError:
         description=data.get("description"),
         stars=data["stargazers_count"],
         forks=data.get("forks_count", 0),
-        open_issues=data.get("open_issues_count", 0),
+        open_issues_and_prs=data.get("open_issues_count", 0),
         language=data.get("language"),
         topics=data.get("topics") or [],
         license=license_info.get("spdx_id") or license_info.get("name"),
@@ -190,7 +196,6 @@ def get_repository_tree(input_data: RepositoryTreeInput) -> RepositoryTreeOutput
             path=path,
             type="file" if kind == "blob" else "dir",
             size=entry.get("size"),
-            sha=entry.get("sha"),
         )))
 
     if prefix_is_file:
@@ -236,7 +241,6 @@ def _read_file(client: GitHubClient, owner: str, repo: str, path: str, max_chars
         content=text[:max_chars],
         size=size,
         truncated=len(text) > max_chars,
-        sha=data.get("sha"),
     )
 
 
@@ -355,6 +359,8 @@ def get_issues(input_data: IssueInput) -> IssuesOutput | ToolError:
     requests; those are removed here (use get_pull_requests for them).
     """
     params: dict[str, Any] = {"state": input_data.state}
+    if input_data.oldest_first:
+        params.update(sort="created", direction="asc")
     if input_data.labels:
         params["labels"] = ",".join(input_data.labels)
     items, has_more = _collect(
@@ -375,7 +381,7 @@ def get_issues(input_data: IssueInput) -> IssuesOutput | ToolError:
         )
         for item in items
     ]
-    return IssuesOutput(issues=issues, total_count=len(issues), has_more=has_more)
+    return IssuesOutput(issues=issues, returned=len(issues), has_more=has_more, note=_list_note("issues", len(issues), has_more))
 
 
 @_tool
@@ -393,7 +399,7 @@ def get_pull_requests(input_data: PullRequestInput) -> PullRequestsOutput | Tool
     }.get(wanted)
     items, has_more = _collect(
         get_client(), f"{_repo_path(input_data)}/pulls",
-        {"state": "closed" if wanted in ("merged", "closed") else wanted},
+        {"state": "closed" if wanted in ("merged", "closed") else wanted, **({"sort": "created", "direction": "asc"} if input_data.oldest_first else {})},
         input_data.limit, keep=keep,
     )
     prs = [
@@ -409,7 +415,7 @@ def get_pull_requests(input_data: PullRequestInput) -> PullRequestsOutput | Tool
         )
         for item in items
     ]
-    return PullRequestsOutput(pull_requests=prs, total_count=len(prs), has_more=has_more)
+    return PullRequestsOutput(pull_requests=prs, returned=len(prs), has_more=has_more, note=_list_note("pull requests", len(prs), has_more))
 
 
 # ---------------------------------------------------------------------------
@@ -426,12 +432,12 @@ def get_commits(input_data: CommitInput) -> CommitsOutput | ToolError:
     """
     params = {"since": input_data.since} if input_data.since else {}
     try:
-        items, _ = _collect(get_client(), f"{_repo_path(input_data)}/commits", params, input_data.limit)
+        items, has_more = _collect(get_client(), f"{_repo_path(input_data)}/commits", params, input_data.limit)
     except GitHubAPIError as exc:
         if exc.kind == "empty_repository":
-            return CommitsOutput(commits=[])
+            return CommitsOutput(commits=[], note=_list_note("commits", 0, False))
         raise
-    return CommitsOutput(commits=[
+    commits = [
         Commit(
             sha=item["sha"],
             message=item["commit"]["message"][:MAX_COMMIT_MESSAGE_CHARS],
@@ -439,7 +445,8 @@ def get_commits(input_data: CommitInput) -> CommitsOutput | ToolError:
             timestamp=item["commit"]["author"]["date"],
         )
         for item in items
-    ])
+    ]
+    return CommitsOutput(commits=commits, returned=len(commits), has_more=has_more, note=_list_note("commits", len(commits), has_more))
 
 
 @_tool
@@ -450,21 +457,19 @@ def get_releases(input_data: ReleaseInput) -> ReleasesOutput | ToolError:
     Returns tag names, release names, publish dates, release notes (truncated)
     and asset metadata. Used to assess versioning strategy and release frequency.
     """
-    items, _ = _collect(get_client(), f"{_repo_path(input_data)}/releases", {}, input_data.limit)
-    return ReleasesOutput(releases=[
+    items, has_more = _collect(get_client(), f"{_repo_path(input_data)}/releases", {}, input_data.limit)
+    releases = [
         Release(
             tag_name=item["tag_name"],
             name=item.get("name"),
             published_at=item.get("published_at"),
             prerelease=item.get("prerelease", False),
+            asset_count=len(item.get("assets", [])),
             body=(item.get("body") or "")[:MAX_RELEASE_BODY_CHARS] or None,
-            assets=[
-                ReleaseAsset(name=a["name"], size=a.get("size", 0), download_count=a.get("download_count", 0))
-                for a in item.get("assets", [])
-            ],
         )
         for item in items
-    ])
+    ]
+    return ReleasesOutput(releases=releases, returned=len(releases), has_more=has_more, note=_list_note("releases", len(releases), has_more))
 
 
 @_tool
@@ -475,11 +480,14 @@ def get_contributors(input_data: ContributorInput) -> ContributorsOutput | ToolE
     Returns contributor login and contribution counts, most active first.
     Used to understand team size and distribution of effort.
     """
-    items, _ = _collect(get_client(), f"{_repo_path(input_data)}/contributors", {}, input_data.limit, ttl=TREE_TTL)
-    return ContributorsOutput(contributors=[
-        Contributor(login=item.get("login", "unknown"), contributions=item["contributions"], avatar_url=item.get("avatar_url"))
-        for item in items
-    ])
+    items, has_more = _collect(get_client(), f"{_repo_path(input_data)}/contributors", {}, input_data.limit, ttl=TREE_TTL)
+    contributors = [Contributor(login=item.get("login", "unknown"), contributions=item["contributions"]) for item in items]
+    total = sum(c.contributions for c in contributors)
+    top_share = round(100 * max((c.contributions for c in contributors), default=0) / total, 1) if total else 0.0
+    return ContributorsOutput(
+        contributors=contributors, returned=len(contributors), has_more=has_more, total_contributions=total,
+        top_contributor_share_pct=top_share, note=_list_note("contributors", len(contributors), has_more),
+    )
 
 
 # ---------------------------------------------------------------------------

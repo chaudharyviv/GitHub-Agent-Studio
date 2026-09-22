@@ -9,7 +9,7 @@ Findings written to memory (categories):
 """
 
 from agents.multi.specialist import SpecialistAgent
-from prompts.multi_agent import get_health_prompt
+from prompts.multi_agent import HEALTH_CATEGORIES, get_health_prompt
 
 
 class HealthSpecialist(SpecialistAgent):
@@ -22,4 +22,5 @@ class HealthSpecialist(SpecialistAgent):
     agent_id = "health_specialist"
     title = "Project Health"
     tools = ("get_repository", "get_commits", "get_issues", "get_pull_requests", "get_releases", "get_contributors")
+    categories = HEALTH_CATEGORIES
     prompt = staticmethod(get_health_prompt)

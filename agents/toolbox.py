@@ -18,11 +18,17 @@ from typing import Any, Callable, Iterable, Optional
 from pydantic import BaseModel, Field, ValidationError
 
 import tools
+from agents.limits import Limits, get_limits
 from memory import Finding, MemoryStore, RepositoryProfile, UserContext
 from memory.schemas import Severity
 from tools import schemas as s
 
-MAX_TOOL_CHARS = 15_000  # cap on what one tool result may add to the model's context
+# Size arguments the model may not choose: the toolbox sets them from its Limits (see agents/limits.py).
+_LIMIT_ARGUMENTS = {
+    "get_file_content": ("max_chars", "file_chars"),
+    "get_dependency_files": ("max_chars_per_file", "dependency_file_chars"),
+    "get_repository_tree": ("max_entries", "tree_entries"),
+}
 
 
 class SaveFindingArgs(BaseModel):
@@ -52,6 +58,10 @@ class MemoryWriteResult(BaseModel):
 
 class RecalledFindings(BaseModel):
     findings: list[dict]
+
+
+class Notice(BaseModel):
+    note: str
 
 
 # name -> (handler in tools.github, input model, LLM-facing description)
@@ -108,16 +118,27 @@ class Toolbox:
         session_id: str,
         agent_name: str = "single_agent",
         include: Optional[Iterable[str]] = None,
+        categories: Optional[Iterable[str]] = None,
+        limits: Optional[Limits] = None,
     ):
+        """
+        ``include`` limits which tools are offered; ``categories`` limits which finding
+        categories save_finding accepts (the model is told the allowed list when it slips);
+        ``limits`` caps result sizes (defaults to LITE_MODE-aware limits).
+        """
+        self.limits = limits or get_limits()
         self.owner, self.repo = owner, repo
+        self.categories = tuple(categories) if categories is not None else None
+        self._fetched: set[tuple[str, str]] = set()  # GitHub calls already answered in this toolbox
         self.store, self.session_id, self.agent_name = store, session_id, agent_name
         self.repo_id = MemoryStore.make_repo_id(owner, repo)
         self._handlers: dict[str, Callable[[dict], Any]] = {}
         self._specs: dict[str, dict] = {}
 
         for name, (fn, model, description) in _GITHUB_TOOLS.items():
-            self._register(name, description, _llm_schema(model, hidden=("owner", "repo")),
-                           lambda args, fn=fn, model=model: fn(model(**{**args, "owner": owner, "repo": repo})))  # bound repo always wins
+            size_arg = _LIMIT_ARGUMENTS.get(name)
+            self._register(name, description, _llm_schema(model, hidden=("owner", "repo", *(size_arg[:1] if size_arg else ()))),
+                           lambda args, fn=fn, model=model, name=name: fn(model(**self._bound_arguments(name, args))))
         for name, (model, description) in _MEMORY_TOOLS.items():
             self._register(name, description, _llm_schema(model),
                            lambda args, name=name, model=model: getattr(self, f"_{name}")(model(**args)))
@@ -125,13 +146,24 @@ class Toolbox:
             wanted = set(include)
             self._specs = {n: sp for n, sp in self._specs.items() if n in wanted}
 
+    def _bound_arguments(self, name: str, args: dict) -> dict:
+        """Model-supplied arguments, with the repository fixed and sizes capped by our limits."""
+        bound = {**args, "owner": self.owner, "repo": self.repo}  # bound repo always wins
+        if "limit" in bound and isinstance(bound["limit"], int):
+            bound["limit"] = min(bound["limit"], self.limits.list_limit)
+        if name in _LIMIT_ARGUMENTS:
+            argument, limit_field = _LIMIT_ARGUMENTS[name]
+            bound[argument] = getattr(self.limits, limit_field)
+        return bound
+
     def _register(self, name: str, description: str, schema: dict, handler: Callable[[dict], Any]) -> None:
         self._specs[name] = {"type": "function", "function": {"name": name, "description": description, "parameters": schema}}
         self._handlers[name] = handler
 
-    def specs(self) -> list[dict]:
-        """OpenAI ``tools=`` parameter."""
-        return list(self._specs.values())
+    def specs(self, only: Optional[Iterable[str]] = None) -> list[dict]:
+        """OpenAI ``tools=`` parameter; ``only`` narrows it to the named tools."""
+        wanted = set(only) if only is not None else None
+        return [spec for name, spec in self._specs.items() if wanted is None or name in wanted]
 
     def call(self, name: str, raw_arguments: str) -> ToolOutcome:
         """Run one tool call exactly as the model requested it. Never raises."""
@@ -142,7 +174,13 @@ class Toolbox:
             arguments = json.loads(raw_arguments or "{}")
             if not isinstance(arguments, dict):
                 raise ValueError("arguments must be a JSON object")
-            result = self._handlers[name](arguments)
+            call_key = (name, json.dumps(arguments, sort_keys=True))
+            if call_key in self._fetched:  # identical GitHub call: don't spend context on the same data twice
+                result = Notice(note="You already fetched exactly this earlier in this investigation; reuse that result instead of calling again.")
+            else:
+                result = self._handlers[name](arguments)
+                if name in _GITHUB_TOOLS and not isinstance(result, s.ToolError):
+                    self._fetched.add(call_key)
         except (ValueError, ValidationError) as exc:  # includes JSONDecodeError
             result = s.ToolError(kind="invalid_input", message=f"Bad arguments for {name}: {exc}")
         except Exception as exc:
@@ -151,8 +189,9 @@ class Toolbox:
         note = self._after_call(name, result)
         is_error = isinstance(result, s.ToolError)
         content = result.model_dump_json(exclude_none=True)
-        if len(content) > MAX_TOOL_CHARS:
-            content = content[:MAX_TOOL_CHARS] + f'... [truncated {len(content) - MAX_TOOL_CHARS} chars]'
+        cap = self.limits.tool_result_chars
+        if len(content) > cap:
+            content = content[:cap] + f"... [truncated {len(content) - cap} chars]"
         return ToolOutcome(
             name=name,
             arguments=arguments,
@@ -178,6 +217,8 @@ class Toolbox:
         return None
 
     def _save_finding(self, args: SaveFindingArgs) -> MemoryWriteResult:
+        if self.categories is not None and args.category not in self.categories:
+            raise ValueError(f"category {args.category!r} is not allowed for you. Call save_finding again with the same finding and one of these categories: {', '.join(self.categories)}")
         for existing in self.store.get_findings(self.repo_id, category=args.category):
             if existing.finding.strip().lower() == args.finding.strip().lower():
                 return MemoryWriteResult(saved=False, message=f"Already recorded as finding #{existing.id}; not saved again.")

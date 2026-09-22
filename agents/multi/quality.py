@@ -9,7 +9,7 @@ Findings written to memory (categories):
 """
 
 from agents.multi.specialist import SpecialistAgent
-from prompts.multi_agent import get_quality_prompt
+from prompts.multi_agent import QUALITY_CATEGORIES, get_quality_prompt
 
 
 class QualitySpecialist(SpecialistAgent):
@@ -22,4 +22,5 @@ class QualitySpecialist(SpecialistAgent):
     agent_id = "quality_specialist"
     title = "Code Quality"
     tools = ("get_repository", "get_repository_tree", "get_file_content", "get_dependency_files")
+    categories = QUALITY_CATEGORIES
     prompt = staticmethod(get_quality_prompt)

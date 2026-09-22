@@ -385,6 +385,13 @@ class MemoryStore:
             )
         return session_id
 
+    def set_session_metadata(self, session_id: str, metadata: str) -> None:
+        """Replace a session's metadata (JSON text), e.g. to store its final report."""
+        with self._tx() as conn:
+            updated = conn.execute("UPDATE sessions SET metadata = ? WHERE session_id = ?", (metadata, session_id)).rowcount
+            if not updated:
+                raise ValueError(f"Unknown session_id {session_id!r}")
+
     def complete_session(self, session_id: str) -> None:
         """Mark a session as complete with a timestamp."""
         with self._tx() as conn:

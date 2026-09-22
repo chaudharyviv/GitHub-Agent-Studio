@@ -14,6 +14,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Windows consoles and redirected output default to a legacy encoding that cannot print the emoji below.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 from tools import (  # noqa: E402
     get_commits,
     get_contributors,
@@ -72,9 +77,9 @@ def run(ref: str) -> bool:
 
     ok &= show("get_dependency_files", get_dependency_files(DependencyFilesInput(**ident)),
                lambda x: f"{[f.path for f in x.files]} -> {x.detected_languages}")
-    ok &= show("get_issues", get_issues(IssueInput(**ident, limit=10)), lambda x: f"{x.total_count} open, has_more={x.has_more}")
+    ok &= show("get_issues", get_issues(IssueInput(**ident, limit=10)), lambda x: f"{x.returned} open, has_more={x.has_more}")
     ok &= show("get_pull_requests", get_pull_requests(PullRequestInput(**ident, state="merged", limit=10)),
-               lambda x: f"{x.total_count} merged, has_more={x.has_more}")
+               lambda x: f"{x.returned} merged, has_more={x.has_more}")
     ok &= show("get_commits", get_commits(CommitInput(**ident, limit=5)),
                lambda x: f"{len(x.commits)} commits, latest {x.commits[0].timestamp if x.commits else 'n/a'}")
     ok &= show("get_releases", get_releases(ReleaseInput(**ident, limit=5)),

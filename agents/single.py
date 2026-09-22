@@ -15,8 +15,10 @@ Findings and user context are saved by the model itself, through memory tools.
 from typing import Any, Iterator, Optional
 
 from agents.base import Agent, AgentEvent, InvestigationResult
+from agents.limits import get_limits
 from agents.loop import DEFAULT_MAX_OUTPUT_TOKENS, resolve_llm, run_tool_loop, tool_log_entry
 from agents.toolbox import Toolbox
+from agents.usage import UsageMeter
 from memory import ConversationMessage, MemoryStore
 from prompts.single_agent import build_memory_context, get_single_agent_system_prompt
 
@@ -31,18 +33,20 @@ class SingleAgent(Agent):
     reasoning and memory updates visible throughout the process.
     """
 
-    def __init__(self, store: MemoryStore, client: Any = None, model: Optional[str] = None, max_steps: int = 10,
+    def __init__(self, store: MemoryStore, client: Any = None, model: Optional[str] = None, max_steps: Optional[int] = None,
                  max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS):
         """
         Args:
             store: Long-term memory (findings, user context, chat history)
             client: OpenAI client; created from OPENAI_API_KEY when omitted
             model: Model name; defaults to OPENAI_MODEL (gpt-4o-mini)
-            max_steps: Most tool-calling rounds before the agent must answer
+            max_steps: Most tool-calling rounds before the agent must answer (default 10, or 6 in LITE_MODE)
             max_output_tokens: Cap on tokens the model may generate per call
         """
         super().__init__("single_agent")
-        self.store, self.max_steps, self.max_output_tokens = store, max_steps, max_output_tokens
+        self.store, self.max_output_tokens = store, max_output_tokens
+        self.max_steps = max_steps or get_limits().single_agent_steps
+        self.usage = UsageMeter()  # tokens and estimated cost across everything this agent has run
         self._client, self._model = client, model
 
     def start_session(self, owner: str, repo: str) -> str:
@@ -79,7 +83,8 @@ class SingleAgent(Agent):
         self.store.save_conversation_message(ConversationMessage(session_id=session_id, role="user", content=query))
 
         tool_log: list[str] = []
-        for event in run_tool_loop(client, model, messages, toolbox, max_steps=self.max_steps, max_output_tokens=self.max_output_tokens):
+        for event in run_tool_loop(client, model, messages, toolbox, max_steps=self.max_steps,
+                                 max_output_tokens=self.max_output_tokens, usage=self.usage):
             if event.kind == "tool_result":
                 tool_log.append(tool_log_entry(event))
             elif event.kind == "final":

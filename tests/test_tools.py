@@ -361,3 +361,119 @@ def test_invalid_input_rejected_by_schema():
         RepositoryInput(owner="a/b", repo="x")
     with pytest.raises(ValueError):
         IssueInput(**REPO, state="bogus")
+
+
+# -- accuracy helpers added after the first live specialist runs ---------------------------
+
+def test_oldest_first_sorts_ascending(gh):
+    get_issues(IssueInput(**REPO, oldest_first=True, limit=1))
+    get_pull_requests(PullRequestInput(**REPO, oldest_first=True, state="merged"))
+    issue_call = next(c for c in gh.calls if c.url.path.endswith("/issues"))
+    pr_call = next(c for c in gh.calls if c.url.path.endswith("/pulls"))
+    for call in (issue_call, pr_call):
+        assert call.url.params["sort"] == "created" and call.url.params["direction"] == "asc"
+    get_issues(IssueInput(**REPO))  # default is newest first: no sort params
+    assert "direction" not in [c for c in gh.calls if c.url.path.endswith("/issues")][-1].url.params
+
+
+def test_contributors_report_top_share_computed_in_code(gh):
+    from tools import get_contributors
+    from tools.schemas import ContributorInput
+
+    gh.overrides["/repos/octo/demo/contributors"] = httpx.Response(200, json=[
+        {"login": "a", "contributions": 60}, {"login": "b", "contributions": 30}, {"login": "c", "contributions": 10},
+    ])
+    result = get_contributors(ContributorInput(**REPO))
+    assert result.total_contributions == 100 and result.top_contributor_share_pct == 60.0
+
+    from tools.client import get_client
+
+    get_client().cache.clear()  # otherwise the first response is served from cache
+    gh.overrides["/repos/octo/demo/contributors"] = httpx.Response(204)
+    empty = get_contributors(ContributorInput(**REPO))
+    assert empty.contributors == [] and empty.top_contributor_share_pct == 0.0
+
+
+def test_repository_exposes_combined_issue_and_pr_count_under_an_honest_name(gh):
+    gh.overrides["/repos/octo/demo"] = httpx.Response(200, json={
+        "name": "demo", "owner": {"login": "octo"}, "stargazers_count": 1, "default_branch": "main", "fork": False,
+        "created_at": "t", "updated_at": "t", "open_issues_count": 85,
+    })
+    result = get_repository(RepositoryInput(**REPO))
+    assert result.open_issues_and_prs == 85 and not hasattr(result, "open_issues")
+
+
+# -- result shape: warnings survive a size cap because they come first -----------------------
+
+def test_flags_come_before_bulky_data_so_a_cut_result_keeps_them():
+    from tools.schemas import (
+        ContributorsOutput, DependencyFile, FileContentOutput, IssuesOutput, PullRequestsOutput, RepositoryTreeOutput,
+    )
+
+    def fields(model):
+        return list(model.model_fields)
+
+    assert fields(FileContentOutput).index("truncated") < fields(FileContentOutput).index("content")
+    assert fields(RepositoryTreeOutput).index("truncated") < fields(RepositoryTreeOutput).index("tree")
+    assert fields(IssuesOutput)[:3] == ["note", "returned", "has_more"] and fields(IssuesOutput)[-1] == "issues"
+    assert fields(PullRequestsOutput)[-1] == "pull_requests"
+    assert fields(ContributorsOutput)[-1] == "contributors"
+    assert fields(DependencyFile).index("truncated") < fields(DependencyFile).index("content")
+
+
+def test_truncated_flag_is_visible_at_the_start_of_the_json(gh):
+    result = get_file_content(FileContentInput(**REPO, path="README.md", max_chars=100))
+    assert result.truncated
+    assert result.model_dump_json().index('"truncated":true') < result.model_dump_json().index('"content"')
+
+
+def test_capped_lists_carry_a_note_that_the_count_is_not_a_total(gh):
+    capped = get_issues(IssueInput(**REPO, limit=1))
+    assert capped.has_more and capped.returned == 1 and "MORE than 1" in capped.note
+    complete = get_issues(IssueInput(**REPO))
+    assert not complete.has_more and "complete list" in complete.note and "exact total" in complete.note
+    prs = get_pull_requests(PullRequestInput(**REPO, state="merged", limit=1))
+    assert prs.has_more is False or "MORE than" in prs.note
+
+
+def test_tree_nodes_carry_no_sha(gh):
+    result = get_repository_tree(RepositoryTreeInput(**REPO))
+    assert all(not hasattr(node, "sha") for node in result.tree)
+    assert "sha" not in result.model_dump_json()
+
+
+# -- every list says whether it is complete, and wastes no tokens on things the model never uses --------
+
+def test_commits_say_how_many_came_back_and_whether_that_is_all(gh):
+    capped = get_commits(CommitInput(**REPO, limit=3))
+    # the fake serves limit+1 items, so a capped list is detected: 3 returned, more exist
+    assert capped.returned == 3 and capped.has_more is True and "MORE than 3" in capped.note
+    assert len(capped.commits) == 3
+
+
+def test_releases_are_slim_and_carry_a_note(gh):
+    from tools import get_releases
+    from tools.schemas import ReleaseInput
+
+    gh.overrides["/repos/octo/demo/releases"] = httpx.Response(200, json=[
+        {"tag_name": "v2", "name": "Two", "published_at": "2026-01-01", "body": "x" * 5000,
+         "assets": [{"name": "a.whl", "size": 1, "download_count": 9}, {"name": "b.tar.gz", "size": 2, "download_count": 3}]},
+    ])
+    result = get_releases(ReleaseInput(**REPO))
+    [release] = result.releases
+    assert release.asset_count == 2 and len(release.body) == 300
+    assert "assets" not in result.model_dump_json() and "download_count" not in result.model_dump_json()
+    assert result.returned == 1 and "complete list" in result.note
+
+
+def test_contributors_carry_no_avatar_urls_and_report_their_own_count(gh):
+    from tools import get_contributors
+    from tools.schemas import ContributorInput
+
+    gh.overrides["/repos/octo/demo/contributors"] = httpx.Response(200, json=[
+        {"login": "a", "contributions": 5, "avatar_url": "https://example.test/a.png"},
+        {"login": "b", "contributions": 5, "avatar_url": "https://example.test/b.png"},
+    ])
+    result = get_contributors(ContributorInput(**REPO))
+    assert result.returned == 2 and "avatar" not in result.model_dump_json()
+    assert result.top_contributor_share_pct == 50.0

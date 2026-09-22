@@ -12,10 +12,11 @@ place, which lets a caller keep the conversation going after the loop ends.
 """
 
 import json
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from agents.base import AgentEvent
 from agents.toolbox import Toolbox
+from agents.usage import UsageMeter
 
 # Cap on tokens the model may write per call. Tool-call rounds need ~100-400 (a sentence + arguments);
 # the longest answer ("Teach me this repo") runs about 1,200-1,800. 2,048 fits that with headroom
@@ -43,22 +44,42 @@ def run_tool_loop(
     *,
     max_steps: int,
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    remind_when_left: int = 0,
+    reminder: str = "",
+    usage: Optional[UsageMeter] = None,
+    last_round_tools: Optional[Iterable[str]] = None,
+    max_reasoning_chars: int = 0,
+    prose_reminder: str = "",
 ) -> Iterator[AgentEvent]:
     """
     Run the loop until the model answers. The last event yielded is 'final' or 'error'.
 
     After ``max_steps`` tool-calling rounds the model is told to answer without tools.
-    The final assistant message is appended to ``messages``.
+    The final assistant message is appended to ``messages``. If ``remind_when_left`` is set,
+    ``reminder`` is injected when that many tool-calling rounds remain (e.g. "save your findings now").
+    Token usage of every call is added to ``usage`` when given.
+
+    Two guards that do not rely on the model obeying the prompt:
+    - ``last_round_tools``: in the final tool-calling round only these tools are offered
+      (specialists use it so the last round can only save findings).
+    - ``max_reasoning_chars``: a message longer than this alongside tool calls means the model is writing
+      analysis instead of acting; ``prose_reminder`` is injected after that round's tool results.
     """
     for step in range(1, max_steps + 2):
         can_use_tools = step <= max_steps
+        if remind_when_left and reminder and max_steps - step + 1 == remind_when_left:
+            messages.append({"role": "system", "content": reminder.format(left=remind_when_left)})
         if not can_use_tools:
             messages.append({"role": "system", "content": "Tool budget used up. Answer now using only what you have gathered, and say what you did not get to check."})
         try:
-            kwargs = {"tools": toolbox.specs(), "tool_choice": "auto"} if can_use_tools else {}
-            choice = client.chat.completions.create(
+            offered = toolbox.specs(only=last_round_tools) if last_round_tools and step == max_steps else toolbox.specs()
+            kwargs = {"tools": offered, "tool_choice": "auto"} if can_use_tools else {}
+            response = client.chat.completions.create(
                 model=model, messages=messages, temperature=0.2, max_completion_tokens=max_output_tokens, **kwargs
-            ).choices[0]
+            )
+            if usage is not None:
+                usage.add(response)
+            choice = response.choices[0]
             reply = choice.message
         except Exception as exc:
             yield AgentEvent(kind="error", step=step, is_error=True, content=explain_llm_error(exc))
@@ -88,6 +109,8 @@ def run_tool_loop(
             if outcome.memory_note:
                 yield AgentEvent(kind="memory", step=step, name=outcome.name, content=outcome.memory_note)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": outcome.content})
+        if max_reasoning_chars and prose_reminder and len(reply.content or "") > max_reasoning_chars:
+            messages.append({"role": "system", "content": prose_reminder})
 
 
 def tool_log_entry(event: AgentEvent) -> str:

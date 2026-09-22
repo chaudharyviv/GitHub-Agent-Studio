@@ -2,6 +2,7 @@
 
 import base64
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -113,9 +114,10 @@ def test_github_errors_pass_through_as_tool_errors(store):
     assert outcome.is_error and outcome.data["kind"] == "not_found"
 
 
-def test_long_results_are_capped(store, monkeypatch):
-    monkeypatch.setattr("agents.toolbox.MAX_TOOL_CHARS", 50)
-    box = Toolbox("octo", "demo", store, store.create_session("octo/demo", "single_agent"))
+def test_long_results_are_capped(store):
+    from agents.limits import NORMAL
+
+    box = Toolbox("octo", "demo", store, store.create_session("octo/demo", "single_agent"), limits=replace(NORMAL, tool_result_chars=50))
     assert "[truncated" in box.call("get_repository", "{}").content
 
 
@@ -243,3 +245,91 @@ def test_tool_calls_on_the_tool_free_final_step_are_not_executed(store):
     )
     result = SingleAgent(store, client=llm, model="m", max_steps=1).investigate("octo", "demo", "Go")
     assert result.answer == "Answering despite the model asking for a tool." and result.error is None
+
+
+# -- cost controls: limits and usage -----------------------------------------------------
+
+def test_size_arguments_are_hidden_from_the_model(store):
+    box = Toolbox("octo", "demo", store, "x")
+    props = {s["function"]["name"]: s["function"]["parameters"]["properties"] for s in box.specs()}
+    assert "max_chars" not in props["get_file_content"] and "path" in props["get_file_content"]
+    assert "max_chars_per_file" not in props["get_dependency_files"] and "max_entries" not in props["get_repository_tree"]
+
+
+def test_limits_override_what_the_model_asks_for(store):
+    from agents.limits import LITE
+
+    box = Toolbox("octo", "demo", store, "x", limits=LITE)
+    assert box._bound_arguments("get_commits", {"limit": 100})["limit"] == LITE.list_limit
+    assert box._bound_arguments("get_commits", {"limit": 5})["limit"] == 5
+    bound = box._bound_arguments("get_file_content", {"path": "a.py", "max_chars": 200_000})
+    assert bound["max_chars"] == LITE.file_chars and bound["owner"] == "octo"
+    # end to end: a model that still passes the hidden argument is not an error
+    assert not box.call("get_file_content", json.dumps({"path": "README.md", "max_chars": 999_999})).is_error
+
+
+def test_lite_mode_switches_limits_and_default_steps(store, monkeypatch):
+    from agents.limits import LITE, NORMAL, get_limits
+    from agents.multi import HealthSpecialist
+
+    assert get_limits() == NORMAL and SingleAgent(store).max_steps == 10 and HealthSpecialist(store).max_steps == 8
+    monkeypatch.setenv("LITE_MODE", "1")
+    assert get_limits() == LITE and SingleAgent(store).max_steps == 6 and HealthSpecialist(store).max_steps == 6
+    assert Toolbox("octo", "demo", store, "x").limits == LITE
+    assert SingleAgent(store, max_steps=3).max_steps == 3  # explicit value wins
+
+
+def test_lite_limits_really_are_smaller():
+    from agents.limits import LITE, NORMAL
+
+    for field in ("tool_result_chars", "file_chars", "dependency_file_chars", "tree_entries", "list_limit", "single_agent_steps", "specialist_steps"):
+        assert getattr(LITE, field) < getattr(NORMAL, field), field
+
+
+def test_usage_meter_counts_tokens_and_prices_them():
+    from agents.usage import UsageMeter
+
+    def response(prompt, completion, cached=0):
+        details = SimpleNamespace(cached_tokens=cached)
+        return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion, prompt_tokens_details=details))
+
+    meter = UsageMeter()
+    meter.add(response(1_000_000, 0))
+    meter.add(response(1_000_000, 1_000_000, cached=1_000_000))
+    meter.add(SimpleNamespace())  # no usage data: ignored
+    assert (meter.calls, meter.prompt_tokens, meter.cached_tokens, meter.completion_tokens) == (2, 2_000_000, 1_000_000, 1_000_000)
+    assert meter.cost_usd == pytest.approx(0.15 + 0.075 + 0.60)
+    assert "2 LLM call(s)" in meter.summary() and "¢" in meter.summary()
+
+
+def test_agent_records_usage_across_calls(store):
+    def with_usage(r, prompt):
+        r.usage = SimpleNamespace(prompt_tokens=prompt, completion_tokens=10, prompt_tokens_details=None)
+        return r
+
+    llm = FakeOpenAI(with_usage(reply("a", [("get_repository", {})]), 1000), with_usage(reply("Done."), 1500))
+    agent = SingleAgent(store, client=llm, model="m")
+    agent.investigate("octo", "demo", "Go")
+    assert (agent.usage.calls, agent.usage.prompt_tokens, agent.usage.completion_tokens) == (2, 2500, 20)
+
+
+def test_a_file_result_keeps_its_truncated_flag_even_when_large(store):
+    import httpx as _httpx
+
+    from agents.limits import LITE
+    from tools.client import GitHubClient as _Client, set_client as _set
+
+    big = "line = 'x'  # comment\n" * 2000  # ~44 KB; JSON escaping inflates it further
+
+    def handler(request):
+        if request.url.path.endswith("/contents/big.py"):
+            return _httpx.Response(200, json={"type": "file", "path": "big.py", "size": len(big), "encoding": "base64",
+                                              "content": base64.b64encode(big.encode()).decode(), "sha": "s"})
+        return _httpx.Response(404, json={"message": "Not Found"})
+
+    _set(_Client(transport=_httpx.MockTransport(handler), sleep=lambda _: None))
+    box = Toolbox("octo", "demo", store, "x", limits=LITE)
+    outcome = box.call("get_file_content", json.dumps({"path": "big.py"}))
+    assert '"truncated":true' in outcome.content
+    assert "[truncated" not in outcome.content  # the generic size cap never had to cut it
+    assert len(outcome.content) <= LITE.tool_result_chars

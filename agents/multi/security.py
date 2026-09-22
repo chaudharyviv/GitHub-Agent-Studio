@@ -10,7 +10,7 @@ Findings written to memory (categories):
 """
 
 from agents.multi.specialist import SpecialistAgent
-from prompts.multi_agent import get_security_prompt
+from prompts.multi_agent import SECURITY_CATEGORIES, get_security_prompt
 
 
 class SecuritySpecialist(SpecialistAgent):
@@ -23,4 +23,5 @@ class SecuritySpecialist(SpecialistAgent):
     agent_id = "security_specialist"
     title = "Security"
     tools = ("get_repository_tree", "get_file_content", "get_dependency_files", "search_code")
+    categories = SECURITY_CATEGORIES
     prompt = staticmethod(get_security_prompt)

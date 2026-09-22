@@ -108,7 +108,7 @@ class RepositoryOutput(BaseModel):
     description: Optional[str] = None
     stars: int
     forks: int = 0
-    open_issues: int = Field(0, description="Open issues + open PRs (GitHub counts them together)")
+    open_issues_and_prs: int = Field(0, description="Open issues PLUS open pull requests, combined (GitHub counts them together)")
     language: Optional[str] = None
     topics: List[str] = []
     license: Optional[str] = None
@@ -142,13 +142,12 @@ class FileTreeNode(BaseModel):
     path: str
     type: Literal["file", "dir"]
     size: Optional[int] = None
-    sha: Optional[str] = None
 
 
 class RepositoryTreeOutput(BaseModel):
-    """Output from get_repository_tree tool."""
+    """Output from get_repository_tree tool. (Flags come first: a too-long result is cut from the end.)"""
+    truncated: bool = Field(False, description="True if the tree was cut short (API limit or max_entries): more files exist than are listed")
     tree: List[FileTreeNode]
-    truncated: bool = Field(False, description="True if the tree was cut short (API limit or max_entries)")
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +161,11 @@ class FileContentInput(RepoRef):
 
 
 class FileContentOutput(BaseModel):
-    """Output from get_file_content tool."""
+    """Output from get_file_content tool. (Flags come first: a too-long result is cut from the end.)"""
     path: str
-    content: str
     size: int = Field(..., description="Full file size in bytes (before truncation)")
-    truncated: bool = False
-    sha: Optional[str] = None
+    truncated: bool = Field(False, description="True if `content` is only the beginning of the file")
+    content: str
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +176,7 @@ class IssueInput(RepoRef):
     """Input for get_issues tool."""
     state: Literal["open", "closed", "all"] = Field("open", description="Filter by state")
     labels: Optional[List[str]] = Field(None, description="Only issues carrying all of these labels")
+    oldest_first: bool = Field(False, description="Sort oldest first instead of newest first (use limit 1 to find the oldest open issue)")
     limit: int = Field(30, ge=1, le=100, description="Maximum number of issues to return")
 
 
@@ -196,9 +195,10 @@ class Issue(BaseModel):
 
 class IssuesOutput(BaseModel):
     """Output from get_issues tool."""
-    issues: List[Issue]
-    total_count: int = Field(..., description="Number of issues returned")
+    note: Optional[str] = Field(None, description="Set when the list is capped: the true total is larger than `returned`")
+    returned: int = Field(..., description="Number of issues in this response (NOT the repository's total)")
     has_more: bool = Field(False, description="True if more matching issues exist beyond `limit`")
+    issues: List[Issue]
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +210,7 @@ class PullRequestInput(RepoRef):
     state: Literal["open", "closed", "merged", "all"] = Field(
         "open", description="Filter by state; 'closed' means closed without merging"
     )
+    oldest_first: bool = Field(False, description="Sort oldest first instead of newest first (use limit 1 to find the oldest open PR)")
     limit: int = Field(30, ge=1, le=100, description="Maximum number of PRs to return")
 
 
@@ -227,9 +228,10 @@ class PullRequest(BaseModel):
 
 class PullRequestsOutput(BaseModel):
     """Output from get_pull_requests tool."""
-    pull_requests: List[PullRequest]
-    total_count: int = Field(..., description="Number of pull requests returned")
+    note: Optional[str] = Field(None, description="Set when the list is capped: the true total is larger than `returned`")
+    returned: int = Field(..., description="Number of pull requests in this response (NOT the repository's total)")
     has_more: bool = False
+    pull_requests: List[PullRequest]
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +254,9 @@ class Commit(BaseModel):
 
 class CommitsOutput(BaseModel):
     """Output from get_commits tool."""
+    note: Optional[str] = Field(None, description="States whether the list is complete or capped; read it before quoting any count")
+    returned: int = Field(0, description="Number of items in this response (NOT necessarily the repository's total)")
+    has_more: bool = Field(False, description="True if more items exist beyond `limit`")
     commits: List[Commit]
 
 
@@ -264,25 +269,21 @@ class ReleaseInput(RepoRef):
     limit: int = Field(30, ge=1, le=100, description="Maximum number of releases to return")
 
 
-class ReleaseAsset(BaseModel):
-    """A downloadable file attached to a release."""
-    name: str
-    size: int = 0
-    download_count: int = 0
-
-
 class Release(BaseModel):
     """Represents a GitHub release."""
     tag_name: str
     name: Optional[str] = None
     published_at: Optional[str] = None
     prerelease: bool = False
-    body: Optional[str] = None
-    assets: List[ReleaseAsset] = []
+    asset_count: int = 0
+    body: Optional[str] = Field(None, description="Start of the release notes only")
 
 
 class ReleasesOutput(BaseModel):
     """Output from get_releases tool."""
+    note: Optional[str] = Field(None, description="States whether the list is complete or capped; read it before quoting any count")
+    returned: int = Field(0, description="Number of items in this response (NOT necessarily the repository's total)")
+    has_more: bool = Field(False, description="True if more items exist beyond `limit`")
     releases: List[Release]
 
 
@@ -299,11 +300,17 @@ class Contributor(BaseModel):
     """Represents a repository contributor."""
     login: str
     contributions: int
-    avatar_url: Optional[str] = None
 
 
 class ContributorsOutput(BaseModel):
     """Output from get_contributors tool."""
+    note: Optional[str] = Field(None, description="States whether the list is complete or capped; read it before quoting any count")
+    returned: int = Field(0, description="Number of items in this response (NOT necessarily the repository's total)")
+    has_more: bool = Field(False, description="True if more items exist beyond `limit`")
+    total_contributions: int = Field(0, description="Sum of contributions across the contributors returned")
+    top_contributor_share_pct: float = Field(
+        0.0, description="Top contributor's percentage of `total_contributions` (only among the contributors returned)"
+    )
     contributors: List[Contributor]
 
 
@@ -320,15 +327,15 @@ class DependencyFile(BaseModel):
     """Represents a dependency file found in the repository."""
     path: str
     type: str  # "npm", "python", "go", "rust", "java", etc.
-    content: str
     truncated: bool = False
+    content: str
 
 
 class DependencyFilesOutput(BaseModel):
     """Output from get_dependency_files tool."""
-    files: List[DependencyFile]
     detected_languages: List[str]
     skipped: List[str] = Field([], description="Manifest paths found but not fetched (cap or fetch error)")
+    files: List[DependencyFile]
 
 
 # ---------------------------------------------------------------------------
