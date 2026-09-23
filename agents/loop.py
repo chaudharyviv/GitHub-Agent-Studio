@@ -15,6 +15,7 @@ import json
 from typing import Any, Iterable, Iterator, Optional
 
 from agents.base import AgentEvent
+from agents.llm import LLMProvider, OpenAIProvider
 from agents.toolbox import Toolbox
 from agents.usage import UsageMeter
 
@@ -25,20 +26,27 @@ DEFAULT_MAX_OUTPUT_TOKENS = 2048
 TRUNCATION_NOTE = "\n\n_(The answer hit the output token limit and was cut off. Ask me to continue.)_"
 
 
-def resolve_llm(client: Any = None, model: Optional[str] = None) -> tuple[Any, str]:
-    """The OpenAI client and model to use; built from OPENAI_API_KEY / OPENAI_MODEL when not injected."""
+def resolve_llm(client: Any = None, model: Optional[str] = None, provider: Optional[LLMProvider] = None) -> LLMProvider:
+    """
+    The ``LLMProvider`` to use.
+
+    ``provider`` wins when given (the extension point for a non-OpenAI provider). Otherwise wraps
+    ``client``/``model`` in an ``OpenAIProvider``, building the client from OPENAI_API_KEY / OPENAI_MODEL
+    when neither is injected.
+    """
+    if provider is not None:
+        return provider
     if client is None:
         from openai import OpenAI
 
         from config import config  # imported lazily: it requires OPENAI_API_KEY to be set
 
         client, model = OpenAI(api_key=config.openai_api_key), model or config.openai_model
-    return client, model or "gpt-4o-mini"
+    return OpenAIProvider(client, model or "gpt-4o-mini")
 
 
 def run_tool_loop(
-    client: Any,
-    model: str,
+    provider: LLMProvider,
     messages: list[dict],
     toolbox: Toolbox,
     *,
@@ -73,10 +81,7 @@ def run_tool_loop(
             messages.append({"role": "system", "content": "Tool budget used up. Answer now using only what you have gathered, and say what you did not get to check."})
         try:
             offered = toolbox.specs(only=last_round_tools) if last_round_tools and step == max_steps else toolbox.specs()
-            kwargs = {"tools": offered, "tool_choice": "auto"} if can_use_tools else {}
-            response = client.chat.completions.create(
-                model=model, messages=messages, temperature=0.2, max_completion_tokens=max_output_tokens, **kwargs
-            )
+            response = provider.chat(messages, tools=offered if can_use_tools else None, max_tokens=max_output_tokens, temperature=0.2)
             if usage is not None:
                 usage.add(response)
             choice = response.choices[0]

@@ -114,10 +114,11 @@ def get_security_prompt(max_steps: int = 8) -> str:
     """
     return _specialist_prompt(
         role="Security Specialist",
-        mission="You assess the repository's security posture using static, heuristic checks only. You are not a vulnerability scanner.",
+        mission="You assess the repository's security posture using static, heuristic checks, plus live CVE search for dependencies you flag. You are not a vulnerability scanner or SCA pipeline.",
         checklist=[
             "get_repository_tree at the root and under .github/ to look for SECURITY.md, dependabot/renovate config, CODEOWNERS and workflow files.",
-            "get_dependency_files: look for unpinned or wildcard version ranges, missing lockfiles, obviously outdated or abandoned packages. You cannot query a CVE database, so never invent CVE ids.",
+            "get_dependency_files: look for unpinned or wildcard version ranges, missing lockfiles, obviously outdated or abandoned packages.",
+            "search_cve for packages/versions you have specific reason to suspect (old, unmaintained, or already flagged). It needs TAVILY_API_KEY and has a small call budget per run, so use it selectively, not on every dependency. It returns search results, not a database match: only cite a cve_id it actually returned, in the exact form given, and only as a lead worth verifying, not a confirmed vulnerability. If it errors (no key, or budget used up), note that and continue with the static checks; never invent a CVE id yourself.",
             "Read CI workflows under .github/workflows: risky triggers (pull_request_target), overly broad permissions, unpinned third-party actions, secrets echoed or passed carelessly.",
             "Scan the tree for files that should not be committed (.env, *.pem, id_rsa, credentials, *.key, config with passwords) and for Dockerfiles; read a Dockerfile if present (root user, ':latest' base images, curl | sh).",
             "If search_code works (it needs a GitHub token and returns an error otherwise), search for secret-like patterns such as 'BEGIN PRIVATE KEY', 'AKIA', 'api_key =', 'password ='. If it errors, note the limitation and move on.",

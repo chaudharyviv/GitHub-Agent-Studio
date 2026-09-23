@@ -27,6 +27,11 @@ class UsageMeter:
         details = getattr(usage, "prompt_tokens_details", None)
         self.cached_tokens += (getattr(details, "cached_tokens", 0) or 0) if details else 0
 
+    def merge(self, other: "UsageMeter") -> None:
+        """Fold another meter's totals into this one (e.g. one agent's usage into a run- or session-wide total)."""
+        for field in ("calls", "prompt_tokens", "cached_tokens", "completion_tokens"):
+            setattr(self, field, getattr(self, field) + getattr(other, field))
+
     @property
     def cost_usd(self) -> float:
         fresh = self.prompt_tokens - self.cached_tokens

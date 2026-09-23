@@ -1,12 +1,14 @@
 """Smoke test for the Streamlit app using Streamlit's headless AppTest, with a fake LLM and fake GitHub."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+from agents.llm import OpenAIProvider
 from tests.test_agent import FakeOpenAI, github, reply
 from tools.client import GitHubClient, set_client
 
@@ -24,7 +26,7 @@ def app(tmp_path, monkeypatch):
         reply("octo/demo is a small demo."),
         reply("Second answer."),
     )
-    monkeypatch.setattr("agents.single.resolve_llm", lambda client=None, model=None: (llm, "gpt-4o-mini"))
+    monkeypatch.setattr("agents.single.resolve_llm", lambda client=None, model=None, provider=None: OpenAIProvider(llm, "gpt-4o-mini"))
     at = AppTest.from_file(APP, default_timeout=15)
     yield at, llm
     set_client(None)
@@ -53,6 +55,23 @@ def test_investigation_flow_and_memory_resume(app):
     assert any("Used 1 tool call" in c.value for c in again.caption)
 
 
+def test_session_cost_accumulates_across_turns(app):
+    at, llm = app
+    llm.replies[0].usage = SimpleNamespace(prompt_tokens=1000, completion_tokens=10, prompt_tokens_details=None)
+    llm.replies[1].usage = SimpleNamespace(prompt_tokens=1500, completion_tokens=10, prompt_tokens_details=None)
+
+    at.run()
+    session_cost = next(m for m in at.sidebar.metric if "Session cost" in m.label)
+    assert session_cost.value == "0.00¢"  # nothing spent yet
+
+    at.sidebar.text_input(key="repo_text").set_value("octo/demo").run()
+    at.chat_input[0].set_value("Analyze it").run()
+    assert not at.exception
+
+    session_cost = next(m for m in at.sidebar.metric if "Session cost" in m.label)
+    assert session_cost.value != "0.00¢"  # the turn's usage was folded into the running session total
+
+
 def test_invalid_repo_shows_error(app):
     at, _ = app
     at.run()
@@ -76,7 +95,7 @@ def test_war_room_runs_the_team_and_shows_then_reloads_the_report(app, monkeypat
 
     at, _ = app
     llm = FakeOpenAI(*team_script())
-    monkeypatch.setattr("orchestration.runner.resolve_llm", lambda client=None, model=None: (llm, "m"))
+    monkeypatch.setattr("orchestration.runner.resolve_llm", lambda client=None, model=None: OpenAIProvider(llm, "m"))
 
     at.run()
     at.sidebar.radio[0].set_value("multi_agent").run()
@@ -104,12 +123,56 @@ def test_war_room_runs_the_team_and_shows_then_reloads_the_report(app, monkeypat
     assert {m.label: m.value for m in again.metric if m.label == "Specialists done"} == {"Specialists done": "4/4"}
 
 
+def test_compare_tab_shows_the_single_agents_real_answer_and_cost(app, monkeypatch):
+    from tests.test_war_room import team_script
+
+    at, llm = app  # llm already scripted for a single-agent turn: tool call, then "octo/demo is a small demo."
+    llm.replies[1].usage = SimpleNamespace(prompt_tokens=1000, completion_tokens=10, prompt_tokens_details=None)
+
+    at.run()
+    at.sidebar.text_input(key="repo_text").set_value("octo/demo").run()
+    at.chat_input[0].set_value("Analyze it").run()
+    assert not at.exception and "octo/demo is a small demo." in at.chat_message[1].markdown[-1].value
+
+    war_room_llm = FakeOpenAI(*team_script())
+    monkeypatch.setattr("orchestration.runner.resolve_llm", lambda client=None, model=None: OpenAIProvider(war_room_llm, "m"))
+    at.sidebar.radio[0].set_value("multi_agent").run()
+    _war_room_button(at).click().run()
+    assert not at.exception and any("War Room finished" in s.value for s in at.success)
+
+    markdown = "\n".join(m.value for m in at.markdown)
+    assert "octo/demo is a small demo." in markdown  # the single agent's real answer, not a placeholder
+    assert "A small, well organized project" in markdown  # the Manager's narrative
+    assert any("¢" in c.value and "Cost not shown" not in c.value for c in at.caption)  # the single agent's turn had a real, non-zero cost
+
+
+def test_war_room_parallel_mode_runs_the_team_and_says_so_in_the_report(app, monkeypatch):
+    from tests.test_war_room import RoutedFakeOpenAI, parallel_team_script
+
+    at, _ = app
+    scripts, other = parallel_team_script()
+    llm = RoutedFakeOpenAI(scripts, other)
+    monkeypatch.setattr("orchestration.runner.resolve_llm", lambda client=None, model=None: OpenAIProvider(llm, "m"))
+
+    at.run()
+    at.sidebar.radio[0].set_value("multi_agent").run()
+    at.sidebar.text_input(key="repo_text").set_value("octo/demo").run()
+    at.radio[0].set_value("Parallel").run()  # the War Room's own Execution mode toggle (main body, not sidebar)
+    _war_room_button(at).click().run()
+
+    assert not at.exception
+    assert any("War Room finished" in s.value for s in at.success)
+    markdown = "\n".join(m.value for m in at.markdown)
+    assert {m.label: m.value for m in at.metric if "Specialists" in m.label or "Findings" in m.label} == {"Findings": "4", "Specialists done": "4/4"}
+    assert "ran **in parallel**" in markdown
+
+
 def test_war_room_can_run_a_single_specialist(app, monkeypatch):
     from tests.test_war_room import NARRATIVE, save
 
     at, _ = app
     llm = FakeOpenAI(reply(None, [save("security_policy", "No SECURITY.md", "warning", 0.6)]), reply("Done."), reply(NARRATIVE))
-    monkeypatch.setattr("orchestration.runner.resolve_llm", lambda client=None, model=None: (llm, "m"))
+    monkeypatch.setattr("orchestration.runner.resolve_llm", lambda client=None, model=None: OpenAIProvider(llm, "m"))
     at.run()
     at.sidebar.radio[0].set_value("multi_agent").run()
     at.sidebar.text_input(key="repo_text").set_value("octo/demo").run()

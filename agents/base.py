@@ -7,7 +7,7 @@ agents emit so the UI can show every decision as it happens.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Literal, Optional, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -21,6 +21,17 @@ class AgentEvent(BaseModel):
     content: str = ""  # reasoning text, result summary, memory note, answer, or error message
     data: Any = None  # tool result payload (JSON-serializable)
     is_error: bool = False
+
+
+def final_or_error(events: Sequence[AgentEvent]) -> Optional[AgentEvent]:
+    """
+    The event that decides a run's outcome: the last 'final' or 'error' in the stream.
+
+    Usually ``events[-1]``, but not always: ``SingleAgent`` can yield a few more events (a silent
+    save-finding nudge) after its real answer, so callers should use this instead of assuming the
+    outcome is whatever came last.
+    """
+    return next((e for e in reversed(events) if e.kind in ("final", "error")), None)
 
 
 class InvestigationResult(BaseModel):

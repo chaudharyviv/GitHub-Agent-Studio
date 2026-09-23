@@ -6,6 +6,7 @@ import httpx
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from agents.llm import OpenAIProvider
 from agents.multi.report import AgentStatus
 from memory import Finding, MemoryStore
 from tests.test_agent import FakeOpenAI, reply
@@ -114,6 +115,45 @@ def test_report_viewer_falls_back_to_markdown_for_older_reports():
     at = AppTest.from_function(_viewer_script, args=("# Old report\nBody [#1]", None, None, None), default_timeout=15).run()
     assert not at.exception and any("Old report" in m.value and ":gray[`#1`]" in m.value for m in at.markdown)
     assert not at.metric
+
+
+# -- "Single vs Team" comparison tab ---------------------------------------------------------------
+
+def _compare_answers_script(single_answer, single_usage, team_narrative, team_usage):
+    from ui.components import compare_answers
+
+    compare_answers(single_answer, single_usage, team_narrative, team_usage)
+
+
+def test_compare_answers_shows_both_texts_and_costs_when_available():
+    at = AppTest.from_function(
+        _compare_answers_script,
+        args=("It is a small CLI toolkit.", "2 LLM call(s) · 500 input tokens (0 cached) · 50 output · ≈ 0.11¢",
+              "## Executive summary\nWell organized.", "9 LLM call(s) · 4,000 input tokens (0 cached) · 300 output · ≈ 0.78¢"),
+        default_timeout=15,
+    ).run()
+    assert not at.exception
+    markdown = "\n".join(m.value for m in at.markdown)
+    assert "small CLI toolkit" in markdown and "Well organized" in markdown
+    assert any("0.11¢" in c.value for c in at.caption) and any("0.78¢" in c.value for c in at.caption)
+    assert not at.info  # both sides had content: no "nothing yet" placeholders
+
+
+def test_compare_answers_handles_nothing_run_yet_without_fabricating_cost():
+    at = AppTest.from_function(_compare_answers_script, args=(None, None, None, None), default_timeout=15).run()
+    assert not at.exception
+    assert any("Ask the Single Agent" in i.value for i in at.info)
+    assert any("Run the War Room" in i.value for i in at.info)
+    assert all("Cost not shown" in c.value for c in at.caption)  # never claims a cost it doesn't have
+
+
+def test_compare_answers_omits_cost_for_an_older_answer_without_live_usage():
+    """An answer loaded from a past session (this browser session never produced it) has no stored cost."""
+    at = AppTest.from_function(_compare_answers_script, args=("An old answer.", None, "An old report.", None), default_timeout=15).run()
+    assert not at.exception
+    markdown = "\n".join(m.value for m in at.markdown)
+    assert "An old answer." in markdown and "An old report." in markdown
+    assert all("Cost not shown" in c.value for c in at.caption)
 
 
 # -- tool timeline, rate limit caption -----------------------------------------------------------
@@ -304,7 +344,7 @@ def test_confirmed_clear_deletes_memory_and_resets_the_screen(app):
 def test_clearing_memory_also_clears_a_saved_war_room_report(app, monkeypatch):
     at, _ = app
     llm = FakeOpenAI(*team_script())
-    monkeypatch.setattr("orchestration.runner.resolve_llm", lambda client=None, model=None: (llm, "m"))
+    monkeypatch.setattr("orchestration.runner.resolve_llm", lambda client=None, model=None: OpenAIProvider(llm, "m"))
     at.run()
     at.sidebar.radio[0].set_value("multi_agent").run()
     at.sidebar.text_input(key="repo_text").set_value("octo/demo").run()

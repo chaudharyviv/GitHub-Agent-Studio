@@ -28,6 +28,17 @@ DISCLAIMER_TEXT = (
 )
 DISCLAIMER = f"> **How to read this report.** {DISCLAIMER_TEXT}"
 
+LIMITATIONS_TEXT = (
+    "## Limitations of this analysis\n"
+    "- Public repositories only.\n"
+    "- Security findings combine dependency-file inspection with an optional live CVE lookup (Tavily search, "
+    "biased toward NVD / GitHub Advisories). This is still **not** a real vulnerability scan, SCA pipeline, or "
+    "exploit verification — a returned CVE id is a lead to verify, not a confirmed match.\n"
+    "- No full static analysis, license-compliance engine, or secret scanning.\n"
+    "- Analysis depth is limited by step budgets, result-size caps, and model context.\n"
+    "- Results depend on the capabilities of the configured model (`gpt-4o-mini` by default) and the system prompts."
+)
+
 
 class AgentStatus(BaseModel):
     """How one team member's run went."""
@@ -43,6 +54,7 @@ class HealthReport(BaseModel):
     session_id: str
     markdown: str  # the complete report: header + narrative + appendix
     narrative: str  # the Manager's part only
+    execution_note: str = ""  # code-generated "How the team ran" section (also folded into `markdown`)
     statuses: list[AgentStatus] = Field(default_factory=list)
     findings: list[Finding] = Field(default_factory=list)
     unknown_refs: list[int] = Field(default_factory=list)  # finding ids the narrative cites that do not exist
@@ -127,12 +139,27 @@ def render_appendix(findings: Sequence[Finding], statuses: Sequence[AgentStatus]
     return "\n".join(lines)
 
 
+def execution_note_text(parallel: bool) -> str:
+    """Code-generated 'how the team ran' section: the isolation trade-off is a fact of the run, not the Manager's opinion."""
+    if parallel:
+        return (
+            "## How the team ran\n"
+            "Specialists ran **in parallel** for speed. They did not see each other's findings during execution; "
+            "the Manager is the only component that sees the complete picture."
+        )
+    return (
+        "## How the team ran\n"
+        "Specialists ran **sequentially**, each one able to see what earlier specialists had already found."
+    )
+
+
 def assemble_report(
-    repo_id: str, statuses: Sequence[AgentStatus], findings: Sequence[Finding], narrative: str, generated_at: datetime
+    repo_id: str, statuses: Sequence[AgentStatus], findings: Sequence[Finding], narrative: str, generated_at: datetime,
+    parallel: bool = False,
 ) -> str:
     """Header + the Manager's narrative + appendix, with a warning if the narrative cites ids that do not exist."""
     parts = [render_header(repo_id, statuses, findings, generated_at)]
     if missing := unknown_citations(narrative, findings):
         parts.append("> ⚠️ The narrative below cites finding ids that do not exist: " + ", ".join(f"#{i}" for i in missing) + ". Check those claims against the appendix.")
-    parts += [narrative.strip(), render_appendix(findings, statuses)]
+    parts += [narrative.strip(), render_appendix(findings, statuses), execution_note_text(parallel), LIMITATIONS_TEXT]
     return "\n\n".join(parts) + "\n"

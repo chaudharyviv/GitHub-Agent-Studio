@@ -360,6 +360,34 @@ class SearchCodeOutput(BaseModel):
     total_count: int = Field(..., description="Total matches GitHub reports (may exceed those returned)")
 
 
+# ---------------------------------------------------------------------------
+# search_cve (optional tool; Security Specialist only)
+# ---------------------------------------------------------------------------
+
+class SearchCVEInput(BaseModel):
+    """Input for search_cve tool. Requires TAVILY_API_KEY (live web search)."""
+    package: str = Field(..., min_length=1, max_length=200, description="Package/library name, e.g. 'lodash', 'requests'")
+    version: Optional[str] = Field(None, max_length=50, description="Version string, if known, to narrow results")
+    ecosystem: Optional[str] = Field(None, max_length=30, description="Package ecosystem, e.g. 'npm', 'python', 'go' (improves search precision)")
+
+
+class CVEMatch(BaseModel):
+    """One search result that looks like it names a vulnerability. Not verified against an authoritative feed."""
+    cve_id: Optional[str] = Field(None, description="CVE identifier if the source page states one, e.g. 'CVE-2023-12345'")
+    severity: Optional[str] = Field(None, description="Severity/CVSS rating if stated on the source page")
+    summary: str = Field(..., description="Short summary of the vulnerability, from the search result")
+    source_url: str
+    source: str = Field(..., description="Domain the result came from, e.g. 'nvd.nist.gov', 'github.com'")
+
+
+class SearchCVEOutput(BaseModel):
+    """Output from search_cve tool."""
+    package: str
+    version: Optional[str] = None
+    matches: List[CVEMatch] = []
+    note: str = Field(..., description="How to read `matches`: e.g. no matches found, or lookup unavailable")
+
+
 # Every tool returns its output or a ToolError.
 ToolResult = Union[
     RepositoryOutput,
@@ -372,5 +400,6 @@ ToolResult = Union[
     ContributorsOutput,
     DependencyFilesOutput,
     SearchCodeOutput,
+    SearchCVEOutput,
     ToolError,
 ]

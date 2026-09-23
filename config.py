@@ -9,6 +9,7 @@ directory, so the app behaves the same wherever it is launched from.
 """
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,6 +29,10 @@ class Config(BaseSettings):
         LITE_MODE: Cheaper test runs: smaller tool results and fewer tool rounds (default: off)
         MAX_OUTPUT_TOKENS: Cap on tokens the LLM may generate per call (default: 2048)
         GITHUB_TOKEN: GitHub API token (optional but recommended)
+        TAVILY_API_KEY: Tavily search API key (optional; enables live CVE lookup for the Security Specialist)
+        MEMORY_BACKEND: "sqlite" (default; persists to agent_memory.db) or "memory" (in-process only,
+            forgotten on restart — for Streamlit Cloud, whose filesystem is itself not durable, so a
+            SQLite file there would falsely look persistent)
     """
 
     model_config = SettingsConfigDict(env_file=ENV_FILE, case_sensitive=False, extra="ignore")
@@ -37,6 +42,8 @@ class Config(BaseSettings):
     max_output_tokens: int = Field(2048, ge=16, le=16_384)  # 16384 is gpt-4o-mini's own per-call output cap
     lite_mode: bool = False
     github_token: str | None = None
+    tavily_api_key: str | None = None
+    memory_backend: Literal["sqlite", "memory"] = "sqlite"
 
 
 # Global config instance

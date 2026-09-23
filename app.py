@@ -13,12 +13,14 @@ Two investigation modes:
 2. Multi-Agent War Room: Specialized agents coordinated by a manager
 """
 
+import os
+
 import streamlit as st
 
 from memory import MemoryStore
 from tools import get_repository, is_error
 from tools.schemas import RepositoryInput
-from ui.components import repo_header, safe_render
+from ui.components import repo_header, safe_render, session_cost_metric
 from ui.sidebar import render_sidebar
 from ui.single_agent import render_single_agent
 from ui.styles import apply_theme
@@ -26,18 +28,41 @@ from ui.war_room import render_war_room
 
 
 @st.cache_resource
-def get_store() -> MemoryStore:
-    return MemoryStore()
+def get_store(backend: str) -> MemoryStore:
+    """
+    The process-wide memory store, shared by every session (see ``memory/store.py``: one connection,
+    safe for concurrent use). "sqlite" persists to ``agent_memory.db``; "memory" (``:memory:``, which
+    ``MemoryStore`` already supports) lives only as long as this process does — the right choice on
+    Streamlit Cloud, whose filesystem is not durable either, so a SQLite file there would just be a
+    slower way to lose the same data, while claiming a persistence the deployment cannot actually offer.
+    """
+    return MemoryStore(":memory:" if backend == "memory" else "agent_memory.db")
+
+
+def _load_secrets_into_env() -> None:
+    """
+    On Streamlit Cloud, secrets are set in ``st.secrets`` (from ``secrets.toml``), not environment
+    variables. Copy them into ``os.environ`` — without overriding anything already set, e.g. by a
+    local ``.env`` — so ``config.Config`` (which only reads the environment) picks them up the same
+    way either way. A no-op locally, where no ``secrets.toml`` exists.
+    """
+    try:
+        for key, value in st.secrets.items():
+            os.environ.setdefault(key, str(value))
+    except Exception:
+        pass  # no secrets.toml configured: nothing to bridge
 
 
 def load_config():
     """Settings need OPENAI_API_KEY; show a friendly message instead of a traceback when it is missing."""
+    _load_secrets_into_env()
     try:
         from config import config
 
         return config
     except Exception:
-        st.error("**OPENAI_API_KEY is not set.** Copy `.env.example` to `.env`, add your key, and restart the app.")
+        st.error("**OPENAI_API_KEY is not set.** Copy `.env.example` to `.env`, add your key, and restart the app "
+                  "(or, on Streamlit Cloud, set it in the app's Secrets).")
         st.stop()
 
 
@@ -60,7 +85,7 @@ def show_repository(owner: str, repo: str) -> bool:
 
 def run_app():
     config = load_config()
-    store = get_store()
+    store = get_store(config.memory_backend)
     side = render_sidebar(config, store)
 
     if not side.repo_text:
@@ -75,6 +100,8 @@ def run_app():
     screen = render_war_room if side.mode == "multi_agent" else render_single_agent
     screen(store, side.owner, side.repo, side.repo_id, max_output_tokens=side.max_output_tokens, lite_mode=side.lite_mode,
            identity=side.identity)
+    with side.cost_slot:  # refresh: the screen above may have just spent money the sidebar was drawn before
+        session_cost_metric()
 
 
 def main():

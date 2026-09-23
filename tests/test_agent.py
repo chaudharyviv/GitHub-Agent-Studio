@@ -82,6 +82,18 @@ def test_toolbox_include_subset(store):
     assert [s["function"]["name"] for s in box.specs()] == ["get_repository"]
 
 
+def test_search_cve_is_opt_in_only(store):
+    """search_cve must never leak to a toolbox that did not explicitly ask for it (e.g. the single agent)."""
+    default_box = Toolbox("octo", "demo", store, "x")  # no `include`: today's single-agent style
+    assert "search_cve" not in {s["function"]["name"] for s in default_box.specs()}
+
+    other_specialist_box = Toolbox("octo", "demo", store, "x", include=["get_repository", "save_finding"])
+    assert "search_cve" not in {s["function"]["name"] for s in other_specialist_box.specs()}
+
+    security_box = Toolbox("octo", "demo", store, "x", include=["search_cve", "save_finding"])
+    assert "search_cve" in {s["function"]["name"] for s in security_box.specs()}
+
+
 def test_repo_is_bound_even_if_model_overrides_it(store):
     box = Toolbox("octo", "demo", store, store.create_session("octo/demo", "single_agent"))
     outcome = box.call("get_repository", json.dumps({"owner": "evil", "repo": "other"}))
@@ -162,6 +174,65 @@ def test_full_investigation_loop(store):
     assert len(history[1].tool_calls) == 3
 
 
+# -- silent save-finding nudge --------------------------------------------------------
+#
+# Unlike specialists (step-budget reminder + a retry if nothing was saved), the single agent's prompt just
+# asks the model to call save_finding; nothing enforces it. A real investigation (>= 2 tool calls) that
+# saves nothing gets one silent follow-up call asking it to save anything worth remembering. The visible
+# answer must never change because of this, and a nudge failure must never look like the turn itself failed.
+
+def test_silent_nudge_saves_a_finding_after_a_real_investigation_that_saved_nothing(store):
+    llm = FakeOpenAI(
+        reply(None, [("get_repository", {})]),
+        reply(None, [("get_file_content", {"path": "README.md"})]),
+        reply("Here is the analysis: a small, well-documented demo project."),
+        reply(None, [("save_finding", {"severity": "info", "category": "docs", "finding": "Has a clear README"})]),
+        reply("Recorded."),
+    )
+    result = SingleAgent(store, client=llm, model="m").investigate("octo", "demo", "Analyze this repository in depth")
+
+    assert result.answer == "Here is the analysis: a small, well-documented demo project." and result.error is None
+    assert [f.finding for f in store.get_findings("octo/demo")] == ["Has a clear README"]
+    assert [e.content for e in result.events if e.kind == "final"] == [result.answer]  # the nudge's own closing text never appears as a second answer
+    history = store.get_conversation_history(result.session_id)
+    assert [(m.role, m.content) for m in history] == [("user", "Analyze this repository in depth"), ("assistant", result.answer)]
+
+
+def test_small_query_does_not_trigger_a_nudge(store):
+    llm = FakeOpenAI(reply(None, [("get_repository", {})]), reply("It has 7 stars."))
+    result = SingleAgent(store, client=llm, model="m").investigate("octo", "demo", "How many stars?")
+    assert result.answer == "It has 7 stars." and result.error is None
+    assert store.get_findings("octo/demo") == [] and len(llm.requests) == 2  # no extra nudge call
+
+
+def test_no_nudge_when_a_finding_was_already_saved(store):
+    llm = FakeOpenAI(
+        reply(None, [("get_repository", {})]),
+        reply(None, [("get_file_content", {"path": "README.md"}), ("save_finding", {"severity": "info", "category": "docs", "finding": "Has a README"})]),
+        reply("Done."),
+    )
+    result = SingleAgent(store, client=llm, model="m").investigate("octo", "demo", "Analyze")
+    assert result.answer == "Done." and len(llm.requests) == 3  # no extra nudge call
+    assert [f.finding for f in store.get_findings("octo/demo")] == ["Has a README"]
+
+
+def test_nudge_failure_does_not_corrupt_the_original_answer(store):
+    class RateLimitError(Exception):
+        pass
+
+    llm = FakeOpenAI(
+        reply(None, [("get_repository", {})]),
+        reply(None, [("get_file_content", {"path": "README.md"})]),
+        reply("Here is the analysis."),
+        RateLimitError("quota exceeded"),
+    )
+    result = SingleAgent(store, client=llm, model="m").investigate("octo", "demo", "Analyze this repository in depth")
+
+    assert result.answer == "Here is the analysis." and result.error is None
+    assert store.get_findings("octo/demo") == []
+    assert any(e.kind == "memory" and "Could not save additional findings automatically" in e.content for e in result.events)
+
+
 def test_follow_up_uses_history_and_memory(store):
     agent = SingleAgent(store, client=FakeOpenAI(reply("First answer.")), model="m")
     sid = agent.start_session("octo", "demo")
@@ -204,6 +275,25 @@ def test_llm_failure_becomes_error_event(store):
 
     result = SingleAgent(store, client=FakeOpenAI(AuthenticationError("bad key")), model="m").investigate("octo", "demo", "Go")
     assert result.error and "OPENAI_API_KEY" in result.error and result.answer == ""
+
+
+def test_explicit_provider_is_used_and_client_model_are_ignored(store):
+    """The `provider` extension point: an injected LLMProvider wins over `client`/`model`."""
+    from agents.llm import LLMProvider
+
+    class MockProvider(LLMProvider):
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, messages, *, tools=None, max_tokens=2048, temperature=0.2):
+            self.calls.append((messages, tools))
+            return reply("Mock answer.")
+
+    provider = MockProvider()
+    result = SingleAgent(store, client="not-a-real-client", model="not-a-real-model", provider=provider).investigate("octo", "demo", "Go")
+
+    assert result.answer == "Mock answer." and result.error is None
+    assert len(provider.calls) == 1
 
 
 def test_run_streams_events_lazily(store):

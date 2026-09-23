@@ -30,6 +30,14 @@ _LIMIT_ARGUMENTS = {
     "get_repository_tree": ("max_entries", "tree_entries"),
 }
 
+# Not repo-scoped like _GITHUB_TOOLS (no owner/repo to inject), and never registered by default:
+# an agent only gets it by naming "search_cve" in ``include`` (today, only the Security Specialist does).
+_CVE_TOOL_DESCRIPTION = (
+    "Look up known CVEs for a dependency (package name + optional version/ecosystem) via live web search, "
+    "biased toward NVD and GitHub Advisories. Not a real vulnerability database: cite only cve_id values the "
+    "result actually contains, never invent one. Budget: a few calls per run."
+)
+
 
 class SaveFindingArgs(BaseModel):
     severity: Severity = Field(..., description="'info' for facts, 'warning' for risks/smells, 'critical' for serious problems")
@@ -129,7 +137,8 @@ class Toolbox:
         self.limits = limits or get_limits()
         self.owner, self.repo = owner, repo
         self.categories = tuple(categories) if categories is not None else None
-        self._fetched: set[tuple[str, str]] = set()  # GitHub calls already answered in this toolbox
+        self._fetched: set[tuple[str, str]] = set()  # GitHub/CVE calls already answered in this toolbox
+        self._cve_lookups_used = 0
         self.store, self.session_id, self.agent_name = store, session_id, agent_name
         self.repo_id = MemoryStore.make_repo_id(owner, repo)
         self._handlers: dict[str, Callable[[dict], Any]] = {}
@@ -142,9 +151,20 @@ class Toolbox:
         for name, (model, description) in _MEMORY_TOOLS.items():
             self._register(name, description, _llm_schema(model),
                            lambda args, name=name, model=model: getattr(self, f"_{name}")(model(**args)))
+        # Opt-in only, unlike the loops above: an agent gets search_cve only by naming it in `include`.
+        if include is not None and "search_cve" in include:
+            self._register("search_cve", _CVE_TOOL_DESCRIPTION, _llm_schema(s.SearchCVEInput), self._call_search_cve)
         if include is not None:
             wanted = set(include)
             self._specs = {n: sp for n, sp in self._specs.items() if n in wanted}
+
+    def _call_search_cve(self, args: dict) -> Any:
+        if self._cve_lookups_used >= self.limits.max_cve_lookups:
+            return s.ToolError(kind="rate_limited",
+                                message=f"CVE lookup budget used up for this run ({self.limits.max_cve_lookups} calls). "
+                                        "Reason about what you already found instead of looking up more.")
+        self._cve_lookups_used += 1
+        return tools.search_cve(s.SearchCVEInput(**args))
 
     def _bound_arguments(self, name: str, args: dict) -> dict:
         """Model-supplied arguments, with the repository fixed and sizes capped by our limits."""
@@ -175,12 +195,13 @@ class Toolbox:
             if not isinstance(arguments, dict):
                 raise ValueError("arguments must be a JSON object")
             call_key = (name, json.dumps(arguments, sort_keys=True))
-            if call_key in self._fetched:  # identical GitHub call: don't spend context on the same data twice
+            if call_key in self._fetched:  # identical GitHub/CVE call: don't spend context (or budget) on the same data twice
                 result = Notice(note="You already fetched exactly this earlier in this investigation; reuse that result instead of calling again.")
             else:
                 result = self._handlers[name](arguments)
-                if name in _GITHUB_TOOLS and not isinstance(result, s.ToolError):
-                    self._fetched.add(call_key)
+                if name in _GITHUB_TOOLS or name == "search_cve":
+                    if not isinstance(result, s.ToolError):
+                        self._fetched.add(call_key)
         except (ValueError, ValidationError) as exc:  # includes JSONDecodeError
             result = s.ToolError(kind="invalid_input", message=f"Bad arguments for {name}: {exc}")
         except Exception as exc:

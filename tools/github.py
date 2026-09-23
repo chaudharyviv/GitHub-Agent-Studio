@@ -13,6 +13,7 @@ import functools
 from typing import Any, Callable, Optional, TypeVar
 from urllib.parse import quote
 
+from agents.limits import get_limits
 from tools.client import GitHubAPIError, GitHubClient, get_client
 from tools.schemas import (
     CodeMatch,
@@ -48,12 +49,9 @@ from tools.schemas import (
 
 F = TypeVar("F", bound=Callable[..., Any])
 
-TREE_TTL = 600.0
-CONTENT_TTL = 900.0
-ACTIVITY_TTL = 120.0  # issues / PRs / commits change often
-
-MAX_COMMIT_MESSAGE_CHARS = 300
-MAX_RELEASE_BODY_CHARS = 300  # cadence and versioning are what matter; full notes are large and rarely needed
+# TTLs, truncation and manifest caps below are internal (not model-tunable, unlike max_chars/max_entries/
+# max_chars_per_file, which are bound by the toolbox from its Limits). They still come from the same
+# Limits object, read fresh per call, so LITE_MODE shrinks them too.
 
 
 def _tool(fn: F) -> F:
@@ -83,7 +81,7 @@ def _collect(
     *,
     keep: Optional[Callable[[dict], bool]] = None,
     max_pages: int = 5,
-    ttl: float = ACTIVITY_TTL,
+    ttl: Optional[float] = None,
 ) -> tuple[list[dict], bool]:
     """
     Gather up to ``limit`` items from a paginated list endpoint.
@@ -91,6 +89,7 @@ def _collect(
     ``keep`` filters client-side (e.g. dropping PRs from the issues feed), which
     may need several pages. Returns (items, has_more).
     """
+    ttl = get_limits().activity_ttl if ttl is None else ttl
     per_page = 100 if keep else min(limit + 1, 100)  # +1 lets us detect "more exists" for free
     items: list[dict] = []
     for page in range(1, max_pages + 1):
@@ -159,7 +158,7 @@ def get_repository(input_data: RepositoryInput) -> RepositoryOutput | ToolError:
 
 def _full_tree(client: GitHubClient, input_data) -> tuple[list[dict], bool]:
     """The whole recursive git tree of the default branch (cached), plus GitHub's truncated flag."""
-    data = client.get(f"{_repo_path(input_data)}/git/trees/HEAD", {"recursive": "1"}, ttl=TREE_TTL)
+    data = client.get(f"{_repo_path(input_data)}/git/trees/HEAD", {"recursive": "1"}, ttl=get_limits().tree_ttl)
     return data.get("tree", []), bool(data.get("truncated"))
 
 
@@ -225,7 +224,7 @@ def get_repository_tree(input_data: RepositoryTreeInput) -> RepositoryTreeOutput
 
 def _read_file(client: GitHubClient, owner: str, repo: str, path: str, max_chars: int) -> FileContentOutput:
     clean = path.strip("/")
-    data = client.get(f"/repos/{owner}/{repo}/contents/{quote(clean, safe='/')}", ttl=CONTENT_TTL)
+    data = client.get(f"/repos/{owner}/{repo}/contents/{quote(clean, safe='/')}", ttl=get_limits().content_ttl)
 
     if isinstance(data, list):
         raise GitHubAPIError("invalid_input", f"'{clean}' is a directory. Use get_repository_tree to list it.")
@@ -294,13 +293,11 @@ _ECOSYSTEM_LANGUAGE = {
     "swift": "Swift",
 }
 _IGNORED_DIRS = {"node_modules", "vendor", "third_party", ".venv", "venv", "testdata", "fixtures", "__fixtures__", "test", "tests", "example", "examples"}
-_MAX_MANIFEST_DEPTH = 4  # path segments, so packages/foo/bar/package.json is the deepest
-_MAX_MANIFESTS = 12
 
 
-def _classify_manifest(path: str) -> Optional[str]:
+def _classify_manifest(path: str, max_depth: int) -> Optional[str]:
     segments = path.split("/")
-    if len(segments) > _MAX_MANIFEST_DEPTH or any(s in _IGNORED_DIRS for s in segments[:-1]):
+    if len(segments) > max_depth or any(s in _IGNORED_DIRS for s in segments[:-1]):
         return None
     name = segments[-1].lower()
     if name in _MANIFESTS:
@@ -320,20 +317,21 @@ def get_dependency_files(input_data: DependencyFilesInput) -> DependencyFilesOut
     manifests, shallowest first. Vendored and test directories are ignored.
     """
     client = get_client()
+    limits = get_limits()
     entries, _ = _full_tree(client, input_data)
 
     found = []
     for entry in entries:
         if entry["type"] != "blob":
             continue
-        kind = _classify_manifest(entry["path"])
+        kind = _classify_manifest(entry["path"], limits.max_manifest_depth)
         if kind:
             found.append((entry["path"], kind))
     found.sort(key=lambda item: (item[0].count("/"), item[0]))
 
     files: list[DependencyFile] = []
-    skipped: list[str] = [path for path, _ in found[_MAX_MANIFESTS:]]
-    for path, kind in found[:_MAX_MANIFESTS]:
+    skipped: list[str] = [path for path, _ in found[limits.max_manifests:]]
+    for path, kind in found[:limits.max_manifests]:
         try:
             content = _read_file(client, input_data.owner, input_data.repo, path, input_data.max_chars_per_file)
         except GitHubAPIError as exc:
@@ -442,10 +440,11 @@ def get_commits(input_data: CommitInput) -> CommitsOutput | ToolError:
         if exc.kind == "empty_repository":
             return CommitsOutput(commits=[], note=_list_note("commits", 0, False))
         raise
+    max_message_chars = get_limits().max_commit_message_chars
     commits = [
         Commit(
             sha=item["sha"],
-            message=item["commit"]["message"][:MAX_COMMIT_MESSAGE_CHARS],
+            message=item["commit"]["message"][:max_message_chars],
             author=item["commit"]["author"].get("name") or (item.get("author") or {}).get("login") or "unknown",
             timestamp=item["commit"]["author"]["date"],
         )
@@ -463,6 +462,7 @@ def get_releases(input_data: ReleaseInput) -> ReleasesOutput | ToolError:
     and asset metadata. Used to assess versioning strategy and release frequency.
     """
     items, has_more = _collect(get_client(), f"{_repo_path(input_data)}/releases", {}, input_data.limit)
+    max_body_chars = get_limits().max_release_body_chars
     releases = [
         Release(
             tag_name=item["tag_name"],
@@ -470,7 +470,7 @@ def get_releases(input_data: ReleaseInput) -> ReleasesOutput | ToolError:
             published_at=item.get("published_at"),
             prerelease=item.get("prerelease", False),
             asset_count=len(item.get("assets", [])),
-            body=(item.get("body") or "")[:MAX_RELEASE_BODY_CHARS] or None,
+            body=(item.get("body") or "")[:max_body_chars] or None,
         )
         for item in items
     ]
@@ -485,7 +485,7 @@ def get_contributors(input_data: ContributorInput) -> ContributorsOutput | ToolE
     Returns contributor login and contribution counts, most active first.
     Used to understand team size and distribution of effort.
     """
-    items, has_more = _collect(get_client(), f"{_repo_path(input_data)}/contributors", {}, input_data.limit, ttl=TREE_TTL)
+    items, has_more = _collect(get_client(), f"{_repo_path(input_data)}/contributors", {}, input_data.limit, ttl=get_limits().tree_ttl)
     contributors = [Contributor(login=item.get("login", "unknown"), contributions=item["contributions"]) for item in items]
     total = sum(c.contributions for c in contributors)
     top_share = round(100 * max((c.contributions for c in contributors), default=0) / total, 1) if total else 0.0

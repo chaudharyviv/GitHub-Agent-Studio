@@ -1,6 +1,7 @@
 """Tests for the Manager, the report, and the War Room runner (scripted fake LLM, no network)."""
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -64,6 +65,7 @@ def test_full_war_room_produces_a_report_from_shared_memory(store):
     assert "A small, well organized project [#1][#2]." in md  # the Manager's narrative
     assert "### Security (1)" in md and "**[#4]** `warning/security_policy` · confidence 0.4 (low)" in md
     assert "_Evidence:_ README.md" in md and "static* analysis" in md  # disclaimer + evidence come from code
+    assert "## Limitations of this analysis" in md and "not** a real vulnerability scan" in md
 
     assert "calls" in result.usage or "LLM call" in result.usage
     assert store.get_session(result.session_id).completed_at is not None
@@ -207,6 +209,95 @@ def test_missing_openai_key_is_one_clear_error_and_creates_no_session(store, mon
 def test_no_matching_specialists_is_an_error(store):
     result = run(store, FakeOpenAI(), only=["nonsense"])
     assert result.error and "No specialists match" in result.error
+
+
+# -- parallel execution --------------------------------------------------------------------
+#
+# A single shared FakeOpenAI (as used above) assumes calls arrive in a fixed global order, which
+# only holds when specialists run one after another. Under the parallel runner, several specialist
+# threads call the fake concurrently, so `RoutedFakeOpenAI` instead gives each specialist its own
+# reply queue, chosen by a marker in its system prompt (e.g. "the Security Specialist") - safe under
+# any thread interleaving, and still lets each specialist's script be its own dedicated scenario.
+
+class RoutedFakeOpenAI:
+    def __init__(self, scripts: dict[str, list], other: list = ()):
+        self._lock = threading.Lock()
+        self._scripts = {marker: list(items) for marker, items in scripts.items()}
+        self._other = list(other)
+        self.requests = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        system = kwargs["messages"][0]["content"]
+        with self._lock:
+            self.requests.append(kwargs)
+            queue_ = next((q for marker, q in self._scripts.items() if marker in system), self._other)
+            item = queue_.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def parallel_team_script(narrative=NARRATIVE, fail=None):
+    """Per-specialist reply queues keyed by role marker. `fail` names an agent_id whose only call raises."""
+    first_categories = {cls.agent_id: cls.categories[0] for cls in SPECIALISTS}
+    scripts = {}
+    for i, cls in enumerate(SPECIALISTS, start=1):
+        marker = f"the {cls.title} Specialist"
+        if cls.agent_id == fail:
+            scripts[marker] = [ConnectionError("offline")]
+        else:
+            scripts[marker] = [
+                reply(None, [save(first_categories[cls.agent_id], f"{cls.title} finding {i}", "warning" if i == 4 else "info", 0.4 if i == 4 else 0.9)]),
+                reply(f"{cls.title} done."),
+            ]
+    return scripts, [reply(narrative)]
+
+
+def test_parallel_war_room_runs_all_specialists_and_produces_a_report(store):
+    scripts, other = parallel_team_script()
+    result = run(store, RoutedFakeOpenAI(scripts, other), parallel=True)
+
+    assert result.error is None and sorted(s.state for s in result.statuses) == ["done"] * 4
+    assert sum(s.findings for s in result.statuses) == 4  # every specialist's finding landed, despite concurrent writes
+    report = result.report
+    assert len(report.findings) == 4 and report.error is None
+    assert "**in parallel**" in report.execution_note and "**in parallel**" in report.markdown
+
+
+def test_parallel_emits_every_agent_start_before_any_agent_done(store):
+    """The defining, deterministic property of "parallel": every specialist starts up front, not one by one."""
+    scripts, other = parallel_team_script()
+    events = list(stream_war_room("octo", "demo", store=store, client=RoutedFakeOpenAI(scripts, other), model="m", parallel=True))
+    kinds = [e.kind for e in events]
+
+    starts = [i for i, k in enumerate(kinds) if k == "agent_start"]
+    first_done = next(i for i, k in enumerate(kinds) if k == "agent_done")
+    assert len(starts) == 4 and max(starts) < first_done
+    assert {e.agent_id for e in events if e.kind == "agent_start"} == {c.agent_id for c in SPECIALISTS}
+    # the Manager still only starts after every specialist has finished
+    assert kinds.index("manager_start") > max(i for i, k in enumerate(kinds) if k == "agent_done")
+
+
+def test_parallel_partial_failure_does_not_stop_the_team(store):
+    scripts, other = parallel_team_script(fail="security_specialist")
+    result = run(store, RoutedFakeOpenAI(scripts, other), parallel=True)
+
+    assert result.error is None  # the run itself still completes
+    by_id = {s.agent_id: s for s in result.statuses}
+    assert by_id["security_specialist"].state == "error" and "offline" in by_id["security_specialist"].message
+    assert all(by_id[a].state == "done" for a in ("architecture_specialist", "health_specialist", "quality_specialist"))
+    assert result.report is not None and result.report.error is None and len(result.report.findings) == 3
+    assert "| Security | ❌ error" in result.report.markdown
+
+
+def test_execution_note_reflects_the_mode(store):
+    sequential = run(store, FakeOpenAI(*team_script()), parallel=False)
+    assert "sequentially" in sequential.report.execution_note and "sequentially" in sequential.report.markdown
+
+    scripts, other = parallel_team_script()
+    parallel = run(store, RoutedFakeOpenAI(scripts, other), parallel=True)
+    assert "**in parallel**" in parallel.report.execution_note
 
 
 # -- report pieces ------------------------------------------------------------------------

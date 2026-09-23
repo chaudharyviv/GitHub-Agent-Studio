@@ -7,13 +7,13 @@ loses it; both screens read the repository from here.
 
 import json
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import streamlit as st
 
 from memory import MemoryStore
 from prompts.single_agent import QUICK_PROMPTS
-from ui.components import github_rate_limit_caption, identity_input, mode_selector, repository_input, runtime_settings
+from ui.components import github_rate_limit_caption, identity_input, mode_selector, repository_input, runtime_settings, session_cost_metric
 
 
 @dataclass
@@ -26,6 +26,8 @@ class SidebarState:
     lite_mode: bool
     max_output_tokens: int
     identity: Optional[str]  # optional name; keeps this person's chat separate on a shared instance
+    cost_slot: Any  # st.empty() placeholder in the sidebar; the caller refreshes it after the screen
+    # runs, since the sidebar is drawn before the turn that updates the session cost happens
 
 
 def reset_screens(keep_new_chat_for: Optional[str] = None):
@@ -88,12 +90,19 @@ def render_sidebar(config, store: MemoryStore) -> SidebarState:
         if repo_id:
             _memory_controls(store, repo_id, mode)
 
+        # a placeholder, not a direct call: this point in the script runs *before* the screen below it,
+        # so a direct call here would always show last run's total, one turn stale; the caller fills it
+        # in (twice: once now so it is never blank, again after the screen updates the running total)
+        cost_slot = st.empty()
+        with cost_slot:
+            session_cost_metric()
         st.info(
             f"**Model:** {config.openai_model}{' · 🪶 lite mode' if lite_mode else ''}  \n"
-            f"**GitHub token:** {'✅ configured' if config.github_token else '❌ not set (60 requests/hour)'}"
+            f"**GitHub token:** {'✅ configured' if config.github_token else '❌ not set (60 requests/hour)'}  \n"
+            f"**Memory:** {'🧠 in-memory (forgotten when this app restarts)' if config.memory_backend == 'memory' else '💾 persistent (SQLite)'}"
         )
         github_rate_limit_caption()
     return SidebarState(
         mode=mode, repo_text=st.session_state.get("repo_text", "").strip(), owner=owner, repo=repo, repo_id=repo_id,
-        lite_mode=lite_mode, max_output_tokens=max_output_tokens, identity=identity,
+        lite_mode=lite_mode, max_output_tokens=max_output_tokens, identity=identity, cost_slot=cost_slot,
     )

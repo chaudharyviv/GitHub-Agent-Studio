@@ -477,3 +477,82 @@ def test_contributors_carry_no_avatar_urls_and_report_their_own_count(gh):
     result = get_contributors(ContributorInput(**REPO))
     assert result.returned == 2 and "avatar" not in result.model_dump_json()
     assert result.top_contributor_share_pct == 50.0
+
+
+# -- search_cve (Tavily-backed CVE lookup) --------------------------------------
+
+def test_search_cve_requires_api_key(monkeypatch):
+    from tools import search_cve
+    from tools.schemas import SearchCVEInput
+
+    # setenv to "" here, NOT delenv: dotenv only fills in a var that is absent from os.environ, so
+    # delenv would let `search_cve`'s own load_dotenv() reload a real key from a developer's .env
+    # (see tests/conftest.py's `normal_limits_by_default` for the same gotcha with LITE_MODE).
+    monkeypatch.setenv("TAVILY_API_KEY", "")
+    result = search_cve(SearchCVEInput(package="lodash"))
+    assert is_error(result) and result.kind == "auth" and "TAVILY_API_KEY" in result.message
+
+
+def test_search_cve_happy_path_extracts_cve_ids(monkeypatch):
+    from tools import search_cve
+    from tools.cve import set_tavily_client
+    from tools.schemas import SearchCVEInput
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    requests = []
+
+    def fake_tavily(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"results": [
+            {"title": "CVE-2023-12345 in lodash", "content": "Prototype pollution in lodash before 4.17.21.", "url": "https://nvd.nist.gov/vuln/detail/CVE-2023-12345"},
+            {"title": "GHSA advisory", "content": "No CVE assigned yet.", "url": "https://github.com/advisories/GHSA-xxxx"},
+        ]})
+
+    set_tavily_client(httpx.Client(transport=httpx.MockTransport(fake_tavily)))
+    try:
+        result = search_cve(SearchCVEInput(package="lodash", version="4.17.15", ecosystem="npm"))
+    finally:
+        set_tavily_client(None)
+
+    assert not is_error(result)
+    assert len(result.matches) == 2
+    assert result.matches[0].cve_id == "CVE-2023-12345" and result.matches[0].source == "nvd.nist.gov"
+    assert result.matches[1].cve_id is None  # no CVE id in that result's text; must not be invented
+    assert "lodash" in requests[0].content.decode() and "4.17.15" in requests[0].content.decode()
+
+
+def test_search_cve_no_results_says_so_without_claiming_safety(monkeypatch):
+    from tools import search_cve
+    from tools.cve import set_tavily_client
+    from tools.schemas import SearchCVEInput
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    set_tavily_client(httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"results": []}))))
+    try:
+        result = search_cve(SearchCVEInput(package="some-obscure-pkg"))
+    finally:
+        set_tavily_client(None)
+    assert result.matches == [] and "does not mean it has no known CVEs" in result.note
+
+
+def test_search_cve_budget_is_capped_per_toolbox_run(monkeypatch):
+    """The Security Specialist's toolbox enforces a call budget so the model cannot spend unlimited Tavily calls."""
+    from agents.limits import LITE
+    from agents.toolbox import Toolbox
+    from memory import MemoryStore
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    from tools.cve import set_tavily_client
+    set_tavily_client(httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"results": []}))))
+    store = MemoryStore(":memory:")
+    try:
+        box = Toolbox("octo", "demo", store, "s1", agent_name="security_specialist",
+                       include=("search_cve",), limits=LITE)  # LITE caps max_cve_lookups at 3
+        # distinct args each call so the toolbox's identical-call dedup doesn't short-circuit before the budget check
+        outcomes = [box.call("search_cve", f'{{"package": "pkg-{i}"}}') for i in range(LITE.max_cve_lookups + 2)]
+    finally:
+        set_tavily_client(None)
+        store.close()
+
+    assert sum(o.is_error for o in outcomes) == 2  # the last 2 calls exceed the budget
+    assert "budget used up" in outcomes[-1].content

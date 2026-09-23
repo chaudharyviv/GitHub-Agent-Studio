@@ -11,10 +11,11 @@ import streamlit as st
 
 from typing import Optional
 
+from agents.base import final_or_error
 from agents.limits import LITE, NORMAL
 from agents.single import SingleAgent
 from memory import MemoryStore
-from ui.components import memory_panel, render_events, tool_timeline
+from ui.components import get_session_usage, memory_panel, render_events, tool_timeline
 
 
 def load_chat(store: MemoryStore, repo_id: str, identity: Optional[str]) -> dict:
@@ -28,7 +29,7 @@ def load_chat(store: MemoryStore, repo_id: str, identity: Optional[str]) -> dict
     for m in store.get_conversation_history(session_id) if session_id else []:
         tools_used = [json.loads(t)["name"] for t in m.tool_calls or []]
         messages.append({"role": m.role, "content": m.content, "events": [], "tools": tools_used})
-    st.session_state.chat = {"repo_id": repo_id, "session_id": session_id, "messages": messages}
+    st.session_state.chat = {"repo_id": repo_id, "session_id": session_id, "messages": messages, "usage": None}
     return st.session_state.chat
 
 
@@ -61,13 +62,16 @@ def run_turn(store: MemoryStore, chat: dict, owner: str, repo: str, prompt: str,
             events.append(event)
             with status:
                 render_events([event], live=True)
-        last = events[-1]
+        # not necessarily events[-1]: a silent save-finding nudge can add a few more events after the answer
+        last = final_or_error(events)
         steps = max((e.step for e in events), default=0)
         status.update(label="Something went wrong" if last.kind == "error" else f"Done: {steps} tool round(s)",
                       state="error" if last.kind == "error" else "complete", expanded=False)
         answer = last.content if last.kind == "final" else ""
         answer_slot.markdown(answer)
         st.caption(f"💲 {agent.usage.summary()}")
+    get_session_usage().merge(agent.usage)
+    chat["usage"] = agent.usage.summary()  # this turn's cost; read by the War Room's "Single vs Team" tab
     chat["messages"].append({"role": "assistant", "content": answer, "events": [e for e in events if e.kind != "final"]})
 
 

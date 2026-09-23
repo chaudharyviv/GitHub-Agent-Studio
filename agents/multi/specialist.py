@@ -13,6 +13,7 @@ from typing import Any, Callable, ClassVar, Iterator, List, Optional
 
 from agents.base import Agent, AgentEvent, InvestigationResult
 from agents.limits import Limits, get_limits
+from agents.llm import LLMProvider
 from agents.loop import resolve_llm, run_tool_loop
 from agents.toolbox import Toolbox
 from agents.usage import UsageMeter
@@ -23,7 +24,6 @@ from prompts.multi_agent import PROSE_REMINDER, SAVE_REMINDER, build_shared_cont
 DEFAULT_SPECIALIST_MAX_OUTPUT_TOKENS = 1536
 MAX_ATTEMPTS = 2  # the second attempt is a nudge for specialists that finish without saving anything
 NUDGE_STEPS = 2  # the nudge attempt only offers the memory tools, so it needs very few rounds
-MAX_REASONING_CHARS = 400  # a longer message alongside tool calls means findings are being written as prose
 
 _NUDGE = (
     "You finished without recording any findings, and the Manager can only see saved findings. "
@@ -56,13 +56,14 @@ class SpecialistAgent(Agent):
         max_steps: Optional[int] = None,
         max_output_tokens: int = DEFAULT_SPECIALIST_MAX_OUTPUT_TOKENS,
         limits: Optional[Limits] = None,
+        provider: Optional[LLMProvider] = None,
     ):
         super().__init__(self.agent_id)
         self.store, self.max_output_tokens = store, max_output_tokens
         self.limits = limits or get_limits()
         self.max_steps = max_steps or self.limits.specialist_steps  # 8, or 5 in LITE_MODE
         self.usage = UsageMeter()  # tokens and estimated cost across everything this agent has run
-        self._client, self._model = client, model
+        self._client, self._model, self._provider = client, model, provider
 
     def start_session(self, owner: str, repo: str) -> str:
         return self.store.create_session(MemoryStore.make_repo_id(owner, repo), "multi_agent")
@@ -84,7 +85,7 @@ class SpecialistAgent(Agent):
     def run(self, owner: str, repo: str, session_id: str, query: Optional[str] = None) -> Iterator[AgentEvent]:
         """Yield events as the specialist works; the last one is 'final' or 'error'."""
         try:
-            client, model = resolve_llm(self._client, self._model)
+            provider = resolve_llm(self._client, self._model, self._provider)
         except Exception as exc:
             yield AgentEvent(kind="error", is_error=True, content=f"Could not start the OpenAI client: {exc}")
             return
@@ -103,10 +104,10 @@ class SpecialistAgent(Agent):
         active_box, active_steps = toolbox, self.max_steps
         for attempt in range(1, MAX_ATTEMPTS + 1):
             final = None
-            for event in run_tool_loop(client, model, messages, active_box, max_steps=active_steps,
+            for event in run_tool_loop(provider, messages, active_box, max_steps=active_steps,
                                        max_output_tokens=self.max_output_tokens, remind_when_left=2 if attempt == 1 else 0, reminder=SAVE_REMINDER,
                                        usage=self.usage, last_round_tools=_MEMORY_TOOLS,
-                                       max_reasoning_chars=MAX_REASONING_CHARS, prose_reminder=PROSE_REMINDER):
+                                       max_reasoning_chars=self.limits.max_reasoning_chars, prose_reminder=PROSE_REMINDER):
                 if event.kind == "final":
                     final = event
                     break

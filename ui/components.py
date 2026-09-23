@@ -19,6 +19,7 @@ import streamlit as st
 from agents.base import AgentEvent
 from agents.multi.report import (
     DISCLAIMER_TEXT,
+    LIMITATIONS_TEXT,
     confidence_label,
     count_by_severity,
     escape_markdown,
@@ -26,6 +27,7 @@ from agents.multi.report import (
     sort_findings,
     unknown_citations,
 )
+from agents.usage import UsageMeter
 from tools import parse_repo_ref
 from tools.client import get_client
 from ui.styles import demote_headings, format_markdown, severity_badge, severity_icon
@@ -117,6 +119,23 @@ def runtime_settings(config) -> tuple[bool, int]:
         help="Cap on tokens the model may generate per call. Higher allows longer answers and reports, at higher cost.",
     )
     return lite_mode, int(max_output_tokens)
+
+
+# ---------------------------------------------------------------------------
+# Session-wide token cost
+# ---------------------------------------------------------------------------
+
+def get_session_usage() -> UsageMeter:
+    """The running token/cost total for this browser session (all turns and War Room runs so far)."""
+    if "session_usage" not in st.session_state:
+        st.session_state.session_usage = UsageMeter()
+    return st.session_state.session_usage
+
+
+def session_cost_metric():
+    """A prominent, always-visible running cost total, so a public deployment never surprises anyone."""
+    usage = get_session_usage()
+    st.metric("💲 Session cost", f"{usage.cost_usd * 100:.2f}¢", help=usage.summary() if usage.calls else "No LLM calls yet this session.")
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +366,8 @@ def agent_status_dashboard(agents: list):
                     st.caption(f"{agent.findings} finding(s)")
 
 
-def report_viewer(report: str, *, narrative: Optional[str] = None, statuses: Optional[list] = None, findings: Optional[list] = None):
+def report_viewer(report: str, *, narrative: Optional[str] = None, statuses: Optional[list] = None, findings: Optional[list] = None,
+                   execution_note: str = ""):
     """
     Display a finished Repository Health Report.
 
@@ -387,6 +407,31 @@ def report_viewer(report: str, *, narrative: Optional[str] = None, statuses: Opt
                 if evidence := evidence_text(f):
                     st.caption("Evidence: " + escape_markdown(evidence))
 
+    if execution_note:
+        st.markdown(execution_note)
+    st.markdown(LIMITATIONS_TEXT)
+
+
+def compare_answers(single_answer: Optional[str], single_usage: Optional[str], team_narrative: Optional[str], team_usage: Optional[str]):
+    """
+    Side by side: the single agent's last chat answer versus the War Room's Manager narrative, each
+    with its cost if this browser session is the one that produced it (cost is not stored with old
+    sessions, only shown live, so an older answer just omits it rather than showing something wrong).
+    """
+    left, right = st.columns(2)
+    for column, title, text, usage, empty_hint in (
+        (left, "🤖 Single agent — last answer", single_answer, single_usage, "Nothing yet. Ask the Single Agent something first."),
+        (right, "🛰️ War Room — Manager's narrative", team_narrative, team_usage, "No report yet. Run the War Room in the first tab."),
+    ):
+        with column:
+            st.subheader(title)
+            if text:
+                st.markdown(format_markdown(demote_headings(escape_markdown(text, keep_emphasis=True))))
+            else:
+                st.info(empty_hint)
+            st.caption(f"💲 {usage}" if usage else "Cost not shown: only tracked for turns run in this browser session.")
+    st.divider()
+
 
 def compare_view(single_findings: list, team_findings: list):
     """
@@ -396,6 +441,7 @@ def compare_view(single_findings: list, team_findings: list):
         single_findings: Findings saved by the single agent (any session)
         team_findings: Findings saved by the specialists in the latest War Room session
     """
+    st.subheader("Findings comparison")
     left, right = st.columns(2)
     for column, title, findings in ((left, "🤖 Single agent", single_findings), (right, "🛰️ War Room team", team_findings)):
         with column:
